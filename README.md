@@ -89,6 +89,8 @@ Please note that this project is maintained on a voluntary basis, and the author
 
 ## Acknowledgements
 
+* __Mr. Daniel__ - Special thanks to Mr. Daniel from RF Candy for referencing this Arduino QN8066 library in his excellent project: [QN8066 RDS FM Transmitter 4W – Arduino Controlled FM Radio Station](https://www.rfcandy.biz/communication/fmtransmitter.html). I am also grateful for the generous donation of one of his transmitter kits.This hardware will greatly enrich my future experiments, testing, and continued development of the library. Community contributions and collaboration like this are invaluable to the growth of open-source projects.
+
 * __Mr. Grazianny Carvalho Tavares__ - I would like to thank Mr. Grazianny Carvalho Tavares, PU7MGR, for introducing me to the QN8066 and encouraging me to develop this library. Mr. Grazianny also played a crucial role in helping me understand various concepts about FM modulation, audio quality criteria, as well as in testing the fundamental functions implemented in this library using equipment for precise value measurements.
 
 * I would like to thank Mr. __Adam Fabio__ for his article published in the online magazine [Hackaday](https://hackaday.com) titled *[Be Your Own DJ With QN8066 And An Arduino Library](https://hackaday.com/2024/08/10/be-your-own-dj-with-qn8066-and-an-arduino-library/)*.
@@ -696,7 +698,7 @@ The examples folder also includes automated build tools:
 
 
 ## References 
-
+* [QN8066 RDS FM transmitter 4W - Arduino controlled FM Radio Station](https://www.rfcandy.biz/communication/fmtransmitter.html)
 * [Be Your Own DJ With QN8066 And An Arduino Library](https://hackaday.com/2024/08/10/be-your-own-dj-with-qn8066-and-an-arduino-library/)
 * [Best Practices for RDS Subcarrier Injection](https://www.radioworld.com/tech-and-gear/tech-tips/best-practices-for-rds-subcarrier-injection?fbclid=IwY2xjawEcUfVleHRuA2FlbQIxMAABHfP62aaiv6Ba38znsFZP59DjN_w-RoKoq6jDkiMpInU-6RAMLcs9__xXDg_aem_MDCR8KMYVsf8s-j5lSPxbA)
 * [Bit Fields in C](https://www.geeksforgeeks.org/bit-fields-c/)
