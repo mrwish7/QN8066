@@ -1,14 +1,8 @@
 /*
-  ESP32 Dev Modeule version - NO_DAC variant.
+  ESP32 Dev Modeule version.
 
-  This variant is for setups feeding the QN8066 from an external analogue audio source (line-in),
-  not from an internally decoded/streamed digital source - so it drops the ESP32-audioI2S
-  streaming/I2S-DAC path entirely (no Audio.h, no I2S pins, no stream URL/volume web fields). RDS
-  is still fully driven by UECP, but with only one UECP source now: the TCP UECP server on port
-  8067 (handleUecpServer() below) - there is no audio-embedded (AAC-DSE/MP2-ancillary) UECP path
-  here, since there's no audio decoder in this sketch to extract it from.
 
-1. This sketch uses HTML form to get and process commands from external browser applications to configure the
+1. This sketch uses HTML form to get and process commands from external browser applications to configure the 
    FM transmitter (see the Python example `esp32_qn8066.py`).
 2. It also utilizes the internal Real Time Clock (RTC) of the ESP32 to send RDS messages with
    this information.
@@ -17,14 +11,14 @@
 5. To connect to your Wi-Fi network, you must provide the SSID and password of your router.
 Otherwise, this application will not function.
 6. This sketch was compiled and tested on the ESP32 Der Module.
-If you are using a different ESP32 model,
+If you are using a different ESP32 model, 
    consider reviewing the pin connections.
-7. In the Arduino IDE, during application execution, check the Serial Monitor for the IP address
+7. In the Arduino IDE, during application execution, check the Serial Monitor for the IP address 
    assigned to the ESP32 by your router's DHCP service.
 8. RDS message updates such as PTY, PS, RT, and Time are not executed immediately.
-This may depend on
+This may depend on 
    the receiver's update timing as well as the distribution of each message's timing programmed in this sketch.
-ESP32 Dev Module Wire up
+ESP32 Dev Module Wire up 
 
   | Device name               |
 QN8066 Pin           |  ESP32 Dev Module |
@@ -63,6 +57,7 @@ Prototype documentation: https://pu2clr.github.io/QN8066/
 #include <WebServer.h>
 #include <time.h>    // Using internal RTC of ESP32
 #include <QN8066.h>
+#include "Audio.h"   // ESP32-audioI2S library
 #include <rds_state.h>
 #include <uecp_handler.h>
 #include <rds_defaults.h>
@@ -71,6 +66,11 @@ Prototype documentation: https://pu2clr.github.io/QN8066/
 #include <oda_directory.h>
 #include <rds_scheduler.h>
 #include <stdarg.h>   // for bufAppend()'s va_list
+
+// --- Audio I2S Pins ---
+#define I2S_BCLK      5
+#define I2S_LRC       6
+#define I2S_DOUT      7
 
 // I2C bus pin on ESP32 or ESP32C3
 #ifdef ARDUINO_ESP32C3_DEV
@@ -86,26 +86,28 @@ Prototype documentation: https://pu2clr.github.io/QN8066/
 // Clock Time (Group 4A) is sent exactly once per UTC minute, aligned to real wall-clock :00
 // boundaries - see buildNextGroup()'s Group 4A branch. No fixed millis()-based interval is used any more.
 
-uint16_t currentFrequency = 1061; // 106.9 MHz
-uint16_t previousFrequency = currentFrequency;
+uint16_t currentFrequency = 1069; // 106.9 MHz
+uint16_t previousFrequency = 1069; // 106.9 MHz
 
-uint8_t currentPower = 28;
+uint8_t currentPower = 25;
 uint8_t currentStereoMono     = 0;
-uint8_t currentPreEmphasis    = 0;
-uint8_t currentFreqDeviation = 83;
-uint8_t currentRdsDeviation = 21;
-uint8_t currentPilotGain = 11;
+uint8_t currentPreEmphasis    = 1;
+// 83 = 75 kHz - the standard/nominal FM deviation reference; see index_html.h's corrected
+// "MPX Deviation" dropdown for the rest of the register-value-to-kHz mapping.
+uint8_t currentFreqDeviation  = 83;
+uint8_t currentRdsDeviation   = 20; // was a hardcoded literal in setup()'s rdsSetFrequencyDeviation() call
+uint8_t currentPilotGain      = 11; // was a hardcoded literal in setup()'s setTxPilotGain() call
 uint8_t currentInputImpedance = 1;
 uint8_t currentBufferGain     = 1;
 uint8_t currentSoftClip       = 0;
 // Wi-Fi setup
 const char* ssid = "ssid";
 // Change to your WIFI SSID
-const char* password = "password";
+const char* password = "pass";
 // Change to your password
 
 // Local Time setup
-const long gmtOffset_sec = 7200;
+const long gmtOffset_sec = -10800;
 // Brasilia local date and time offset (-3h)
 const int daylightOffset_sec = 0;
 // There is some confusion about this here in Brazil.
@@ -127,8 +129,8 @@ uint8_t computeLocalOffsetByte() {
 // Web server
 WebServer server(80);
 
-// UECP TCP server (UECP_MAX_FRAME is defined in uecp_handler.h) - the only source of UECP frames
-// in this NO_DAC variant (no audio decoder here to carry an embedded AAC-DSE/MP2-ancillary path).
+// UECP TCP server (UECP_MAX_FRAME is defined in uecp_handler.h) - a second source of UECP frames
+// alongside the AAC/MP2 audio-embedded path below; both feed the same uecpRdsState.
 #define UECP_TCP_PORT    8067
 #define UECP_MAX_CLIENTS 4
 WiFiServer uecp_server(UECP_TCP_PORT);
@@ -142,23 +144,30 @@ struct UecpClient {
 UecpClient uecp_clients[UECP_MAX_CLIENTS];
 
 QN8066 tx;
+Audio audio; // Audio object for streaming
+// Fixed-size buffer rather than String: this is a long-lived global, updated repeatedly over the
+// device's uptime by the web interface, and a growable String here would be a heap-fragmentation
+// risk over a 24/7 run (see the other String -> char[] conversions below for the same reasoning).
+char currentStreamUrl[128] = "http://192.168.1.101:8000/stream.mp3";
+uint8_t currentVolume = 21; // Max volume for I2S audio is 21
 
 bool rawGroupMode = false;
 
-// RDS state fed by UECP frames from the TCP server below and by the web interface. This is the
+// RDS state fed by UECP frames from either source (the audio stream's DSE/ancillary data via
+// audio_process_uecp(), or the TCP UECP server below) and by the web interface. This is now the
 // single source of truth for everything buildNextGroup() transmits.
 RdsTxState uecpRdsState;
+
+// Per-group free-format queues fed by UECP MEC 0x24/0x30/0x40/0x46 - see free_format_groups.h.
+// Independent of uecpRdsState: this is purely additional groups/content layered on top of this
+// project's own fixed struct-backed ones (0A/1A/2A/3A-manual/4A/10A), not a replacement for any of it.
+FreeFormatPool ffPool;
 
 // Persistent ODA AID -> group directory, learned from live Group 3A traffic - see
 // oda_directory.h and uecp_handler.cpp's isGroup3A handling. Outlives ffPool's own Group 3A
 // queue entries (which get freed after a one-shot transmission); only a Group 3A "wipe all"
 // clears this.
 OdaLiveDirectory odaLiveDir;
-
-// Per-group free-format queues fed by UECP MEC 0x24/0x30/0x40/0x46 - see free_format_groups.h.
-// Independent of uecpRdsState: this is purely additional groups/content layered on top of this
-// project's own fixed struct-backed ones (0A/1A/2A/3A/4A/10A), not a replacement for any of it.
-FreeFormatPool ffPool;
 
 // Set (to a group index) by uecp_handler.cpp when a MEC 0x46 "immediate" priority message is
 // applied - see buildNextGroup()'s own check of this below. FF_INDEX_NONE (its usual value) means
@@ -170,6 +179,11 @@ uint8_t pendingImmediateGroupIndex = FF_INDEX_NONE;
 // the web interface's UECP Site/Encoder Address fields.
 uint16_t uecpOurSite    = 0;
 uint8_t  uecpOurEncoder = 0;
+
+void audio_process_uecp(const uint8_t* data, size_t len) {
+    processUecpFrame(data, (uint16_t)len, "AAC-DSE", uecpRdsState, ffPool, odaLiveDir,
+                     pendingImmediateGroupIndex, uecpOurSite, uecpOurEncoder);
+}
 
 // Group scheduler state. The sequence position itself (rdsSeqPos) now lives in uecpRdsState
 // (rds_state.h) alongside the sequence it walks, not here - see that struct's rdsSequence[]/
@@ -196,13 +210,15 @@ time_t lastCtMinuteSent = -1;
 // free-format queue for whatever index is up first regardless of which group that is, and only
 // falls back to struct content for 0/2/4/6/20; an added slot with nothing queued for it is
 // silently skipped (see buildNextGroup()'s retry loop) rather than transmitting nothing that
-// cycle, so listing extra indices "just in case" costs nothing when they're empty. 16 (Group 8A)
-// is reserved here purely so MEC 0x30 TMC content actually gets transmitted - it has no struct
-// fallback of its own, so it only ever carries free-format content, but it still needs a slot in
-// this sequence to be checked at all (an omitted index is never dequeued, no matter what's queued
-// for it).
-const uint8_t RDS_SEQUENCE[]   = {0, 4, 0, 4, 0, 4, 0, 4, 0, 6, 0, 4, 0, 24, 0, 4, 0, 2, 0, 16, 0, 20};
-const uint8_t RDS_SEQUENCE_LEN = 22;
+// cycle, so listing extra indices "just in case" costs nothing when they're empty.
+// Sequence: 5 × Group 0A (PS), 1 × Group 1A (PIN/SLC), 3 × Group 2A (RT), plus one reserved slot
+// each for Group 3A (ODA AID/group announcements - free-format or manual "master data", see
+// buildGroup3A()), Group 8A (16 - reserved purely so MEC 0x30 TMC content actually gets
+// transmitted; it has no struct fallback of its own, so an omitted index would leave any queued
+// TMC content never dequeued regardless of what's in it), and Group 10A (PTYN) per 12-group
+// cycle. Gives ~950ms full PS cycle and ~2.5s full RT cycle at 11.4 groups/sec.
+const uint8_t RDS_SEQUENCE[]   = {0, 0, 4, 0, 0, 4, 0, 4, 2, 6, 16, 20};
+const uint8_t RDS_SEQUENCE_LEN = 12;
 #include "index_html.h"
 
 void handleRoot() {
@@ -259,6 +275,8 @@ void handleStatus() {
   jsonEscape(psUtf8, psEscaped, sizeof(psEscaped));
   char rtEscaped[sizeof(rtUtf8) * 2];
   jsonEscape(rtUtf8, rtEscaped, sizeof(rtEscaped));
+  char urlEscaped[sizeof(currentStreamUrl) * 2];
+  jsonEscape(currentStreamUrl, urlEscaped, sizeof(urlEscaped));
 
   static char json[1536]; // static: keeps this off the (much more limited) task stack
   size_t pos = 0;
@@ -275,6 +293,8 @@ void handleStatus() {
   bufAppend(json, sizeof(json), &pos, ",\"rds_pty\":%u", uecpRdsState.pty);
   bufAppend(json, sizeof(json), &pos, ",\"rds_ps\":\"%s\"", psEscaped);
   bufAppend(json, sizeof(json), &pos, ",\"rds_rt\":\"%s\"", rtEscaped);
+  bufAppend(json, sizeof(json), &pos, ",\"stream_url\":\"%s\"", urlEscaped);
+  bufAppend(json, sizeof(json), &pos, ",\"stream_volume\":%u", currentVolume);
   bufAppend(json, sizeof(json), &pos, ",\"rds_dsn\":%u", uecpRdsState.dsn);
   bufAppend(json, sizeof(json), &pos, ",\"rds_psn\":%u", uecpRdsState.psn);
   bufAppend(json, sizeof(json), &pos, ",\"uecp_site\":\"%s\"", uecpSiteBuf);
@@ -297,7 +317,17 @@ void handleUpdate() {
   server.argName(0).toCharArray(field, sizeof(field));
   // Processa e aplica o valor do campo correspondente
 
-  if (strcmp(field, "frequency") == 0) {
+  if (strcmp(field, "stream_url") == 0) {
+    server.arg("stream_url").toCharArray(currentStreamUrl, sizeof(currentStreamUrl));
+    audio.stopSong();
+    audio.connecttohost(currentStreamUrl);
+    Serial.printf("Stream URL updated to: %s\n", currentStreamUrl);
+  } else if (strcmp(field, "stream_volume") == 0) {
+    currentVolume = server.arg("stream_volume").toInt();
+    if (currentVolume > 21) currentVolume = 21;
+    audio.setVolume(currentVolume);
+    Serial.printf("Stream Volume updated to: %u\n", currentVolume);
+  } else if (strcmp(field, "frequency") == 0) {
     char frequency[16];
     server.arg("frequency").toCharArray(frequency, sizeof(frequency));
     currentFrequency = (uint16_t) (atof(frequency) * 10);
@@ -536,6 +566,10 @@ void handleUpdate() {
 
 // Função para tratar o envio do formulário
 void handleFormSubmit() {
+  char stream_url[128];
+  server.arg("stream_url").toCharArray(stream_url, sizeof(stream_url));
+  char stream_volume[8];
+  server.arg("stream_volume").toCharArray(stream_volume, sizeof(stream_volume));
   char frequency[16];
   server.arg("frequency").toCharArray(frequency, sizeof(frequency));
   char power[8];
@@ -593,12 +627,26 @@ void handleFormSubmit() {
   char   response[512];
   size_t rpos = 0;
   bufAppend(response, sizeof(response), &rpos, "<html><body><h1>Settings Received</h1>");
+  bufAppend(response, sizeof(response), &rpos, "<p>Stream URL: %s</p>", stream_url);
+  bufAppend(response, sizeof(response), &rpos, "<p>Stream Volume: %s</p>", stream_volume);
   bufAppend(response, sizeof(response), &rpos, "<p>Frequency: %s MHz</p>", frequency);
   bufAppend(response, sizeof(response), &rpos, "<p>Power%%: %s</p>", power);
   bufAppend(response, sizeof(response), &rpos, "<p>RDS PTY: %s</p>", rds_pty);
   bufAppend(response, sizeof(response), &rpos, "<p>RDS PS: %s</p>", rds_ps);
   bufAppend(response, sizeof(response), &rpos, "<p>RDS RT: %s</p>", rds_rt);
   bufAppend(response, sizeof(response), &rpos, "</body></html>");
+
+  if (stream_url[0] != '\0' && strcmp(stream_url, currentStreamUrl) != 0) {
+    snprintf(currentStreamUrl, sizeof(currentStreamUrl), "%s", stream_url);
+    audio.stopSong();
+    audio.connecttohost(currentStreamUrl);
+  }
+
+  if (stream_volume[0] != '\0') {
+    currentVolume = atoi(stream_volume);
+    if (currentVolume > 21) currentVolume = 21;
+    audio.setVolume(currentVolume);
+  }
 
   if (frequency[0] != '\0') {
     currentFrequency = (uint16_t) (atof(frequency) * 10);
@@ -666,7 +714,7 @@ void handleFormSubmit() {
   uecpRdsState.diPtyi = (strcmp(rds_di_compressed, "1") == 0) ? (uecpRdsState.diPtyi | 0x04) : (uecpRdsState.diPtyi & (uint8_t)~0x04);
   uecpRdsState.diPtyi = (strcmp(rds_ptyi,          "1") == 0) ? (uecpRdsState.diPtyi | 0x08) : (uecpRdsState.diPtyi & (uint8_t)~0x08);
 
-  currentFreqDeviation = atoi(frequency_deviation);
+  currentFreqDeviation  = atoi(frequency_deviation);
   currentInputImpedance = atoi(input_impedance);
   currentStereoMono     = atoi(stereo_mono);
   currentBufferGain     = atoi(buffer_gain);
@@ -681,6 +729,8 @@ void handleFormSubmit() {
 
   server.send(200, "text/html", response);
 }
+
+
 
 void processSerialGroups() {
   if (Serial.available() < 8) return;
@@ -817,10 +867,27 @@ void setup() {
   // Sets the current RTC based on Network if it is available
   configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
 
-  Serial.println("Transmitting (analogue audio in)...");
+  // --- AUDIO SETUP ---
+  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  audio.setVolume(currentVolume);
+  audio.connecttohost(currentStreamUrl);
+
+  Serial.println("Trasmitting & Streaming...");
 }
 
 void loop() {
+  audio.loop(); // Required to process the audio stream buffer continuously
+
+  // 24/7 Watchdog: If the stream stops abruptly, try to reconnect every 10 seconds
+  static unsigned long lastAudioCheck = 0;
+  if (millis() - lastAudioCheck > 10000) {
+    if (!audio.isRunning() && currentStreamUrl[0] != '\0') {
+      Serial.println("Stream dropped. Reconnecting...");
+      audio.connecttohost(currentStreamUrl);
+    }
+    lastAudioCheck = millis();
+  }
+
   server.handleClient();
   handleUecpServer();
   rdsSchedulerApplyPendingTime(uecpRdsState);

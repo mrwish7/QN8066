@@ -64,7 +64,7 @@ uint8_t QN8066::scanI2CBus(uint8_t *device) {
 /**
  * @ingroup group02 I2C
  * @brief Gets register information
- * @details QN8066 commands. It provides a means to run commands that are not currently supported by the standard API.
+ * @details 8066 commands. It provides a means to run commands that are not currently supported by the standard API.
  * @param registerNumber
  * @return uint8_t Value of the register
  */
@@ -81,8 +81,8 @@ uint8_t QN8066::getRegister(uint8_t registerNumber) {
 
 /**
  * @ingroup group02 I2C
- * @brief Stores a value to a given register
- * @details QN8066 commands. It provides a means to run commands that are not currently supported by the standard API.
+ * @brief Stores a velue to a given register
+ * @details 8066 commands. It provides a means to run commands that are not currently supported by the standard API.
  * @param registerNumber
  * @param value
  */
@@ -193,7 +193,7 @@ qn8066_status3 QN8066::getStatus3() {
 /**
  * @ingroup group02 Init Device
  * @brief Starts the  QN8066 instance.  
- * @details It is a minimalist code to initiate the QN8066 device. Use the function setup if you want more options during the start process.
+ * @details It is a minimalist code to initiate the QN8066 device. Use the function setup if you want more option during the start process.
  * @details Example
  * @code 
  * #include <QN8066.h>
@@ -672,6 +672,7 @@ void QN8066::setTX(uint16_t frequency) {
   this->setRegister(QN_FDEV, this->fdev.raw);    // FDEV => 01111101 => 125 (Decimal)
   this->setRegister(QN_RDS, this->rds.raw);     // RDS => 00111100 => Line_in_en = 0; RDSFDEV = 60 (Decimal) 
   this->setRegister(QN_GPLT, this->gplt.raw);    // GPLT => 00111001 => Tx_sftclpth = 00 (12’d2051 - 3db back off from 0.5v); t1m_sel = 11 (Infinity); GAIN_TXPLT = 1001 (9% 75 kHz)
+  this->setRegister(QN_PAC, this->pac.raw);
 
   int16_t auxFreq = (frequency - 600)  * 2;
   this->int_ctrl.raw =  0B00100000 | auxFreq >> 8;
@@ -888,13 +889,10 @@ void QN8066::setPreEmphasis( uint8_t value ) {
  */
 void QN8066::setTxPilotGain(uint8_t value) {
   qn8066_gplt gptl;
-
-  if (value > 6 && value < 11) {
-    gptl.raw = this->getRegister(QN_GPLT);
-    gptl.arg.GAIN_TXPLT = value;
-    this->setRegister(QN_GPLT, gptl.raw);
-    this->gplt = gptl;
-  }
+  gptl.raw = this->getRegister(QN_GPLT);
+  gptl.arg.GAIN_TXPLT = value;
+  this->setRegister(QN_GPLT, gptl.raw);
+  this->gplt = gptl;
 }
 
 /**
@@ -1243,37 +1241,10 @@ void QN8066::setTxSoftClippingEnable( bool value) {
   this->reg_vga = reg_vga;
 }
 
-
-/**
- * @ingroup group04  TX Setup
- * @brief Specify total TX frequency deviation (lagacy).
- * @details TX frequency deviation = 0.69KHz*TX_FEDV. The default value is 108 (Binary: 01101100)
- * @param value  
- * @details Example
- * @code 
- * #include <QN8066.h>
- * QN8066 tx;
- * void setup() {
- *   tx.setup();
- *   tx.setTX(1069); // Set the transmitter to 106.9 MHz 
- *   // Please use tx.setTxFrequencyDeviation(120) instead 
- *   tx.setTxFrequencyDerivation(120);  // About +- 84 kHz
- * }
- *
- * void loop() {
- * }
- * @endcode    
- */
- void QN8066::setTxFrequencyDerivation(uint8_t value) {
-  this->fdev.raw = value; 
-  this->setRegister(QN_FDEV, value );
- }
-
  /**
  * @ingroup group04  TX Setup
  * @brief Specify total TX frequency deviation.
  * @details TX frequency deviation = 0.69KHz*TX_FEDV. The default value is 108 (Binary: 01101100)
- * @details Same setTxFrequencyDerivation. Just an adjust of setTxFrequencyDerivation
  * @param value  
  * @details Example
  * @code 
@@ -1313,23 +1284,19 @@ void QN8066::setTxSoftClippingEnable( bool value) {
  * }
  * @endcode   
  */
-void QN8066::setPAC(uint8_t PA_TRGT) {
-
-  this->pac.raw = this->getRegister(QN_PAC);
-  this->pac.arg.PA_TRGT = PA_TRGT;
-  this->pac.arg.TXPD_CLR = !(this->pac.arg.TXPD_CLR); // Reset aud_pk ( Toggle the value)
-
-  if ( PA_TRGT > 23 ) { 
-    this->setRegister(QN_PAC, this->pac.raw );
-  }
-
+void QN8066::setPAC(uint8_t value) {
+  qn8066_pac pac;
+  pac.raw = this->getRegister(QN_PAC);
+  pac.arg.PA_TRGT = value;
+  pac.arg.TXPD_CLR = !(this->pac.arg.TXPD_CLR); // Reset aud_pk ( Toggle the value)
+  this->setRegister(QN_PAC, pac.raw );
+  this->pac = pac;
   // resets the FMS bit by resetting bit 6 which will "Reset the state to initial states and recalibrate all blocks"
   this->system1.arg.recal = 1;
   this->setRegister(QN_SYSTEM1,this->system1.raw);    // Test
   delay(100);
   this->system1.arg.recal = 0;
   this->setRegister(QN_SYSTEM1,this->system1.raw);    // Test
-
 }
 
 /**
@@ -1676,18 +1643,19 @@ bool QN8066::rdsGetTxUpdated() {
  *   tx.setup();
  *   tx.setTX(1069); // Set the transmitter to 106.9 MHz 
  *   tx.rdsTxEnable(true);
- *   tx.rdsSetFrequencyDerivation();
+ *   tx.rdsSetFrequencyDeviation();
  * }
  *
  * void loop() {
  * }
  * @endcode    
  */
-void QN8066::rdsSetFrequencyDerivation(uint8_t freq) {
+void QN8066::rdsSetFrequencyDeviation(uint8_t freq) {
   qn8066_rds rds;
   rds.raw = this->getRegister(QN_RDS);
   rds.arg.RDSFDEV = freq;
-  this->setRegister(QN_RDS, rds.raw);  
+  this->setRegister(QN_RDS, rds.raw);
+  this->rds = rds;
 } 
 
 /**
@@ -1775,12 +1743,65 @@ void QN8066::rdsSendGroup(RDS_BLOCK1 block1, RDS_BLOCK2 block2, RDS_BLOCK3 block
   this->rdsSetTxToggle(); 
   delay(this->rdsSyncTime); // This time is very critical and may need to be tuned. Check the function/method rdsSetSyncTime 
   // checks for the RDS_TXUPD . 
-  while ( this->rdsGetTxUpdated() == toggle  && count < 10) { 
+  while ( this->rdsGetTxUpdated() == toggle  && count < 10) {
     delay(1);
     count++;
   }
-  if (count >= 10 ) 
+  if (count >= 10 )
     this->rdsSendError = 1;
+}
+
+/**
+ * @ingroup group05 TX RDS
+ * @brief Starts sending a RDS group (four blocks) without blocking/polling for confirmation.
+ * @details Same register writes and RDSRDY toggle as rdsSendGroup(), but returns immediately
+ *          instead of waiting for the chip to confirm it fetched the data - call rdsIsGroupSent()
+ *          afterwards (as often as convenient) until it reports true before calling this again
+ *          with the next group. Writing a new group before the previous one is confirmed consumed
+ *          risks corrupting whichever one the chip hasn't fetched yet.
+ * @param block1 - RDS_BLOCK1 datatype
+ * @param block2 - RDS_BLOCK2 datatype
+ * @param block3 - RDS_BLOCK3 datatype
+ * @param block4 - RDS_BLOCK4 datatype
+ * @see rdsIsGroupSent, rdsSendGroup
+ */
+void QN8066::rdsSendGroupAsync(RDS_BLOCK1 block1, RDS_BLOCK2 block2, RDS_BLOCK3 block3, RDS_BLOCK4 block4) {
+
+  this->rdsAsyncToggle = this->rdsGetTxUpdated();
+  this->rdsSendError = 0;
+
+  this->setRegister(QN_TX_RDSD0, block1.byteContent[1]); // Most Significant Byte First.
+  this->setRegister(QN_TX_RDSD1, block1.byteContent[0]);
+
+  this->setRegister(QN_TX_RDSD2, block2.byteContent[1]); // Most Significant Byte First.
+  this->setRegister(QN_TX_RDSD3, block2.byteContent[0]);
+
+  this->setRegister(QN_TX_RDSD4, block3.byteContent[1]); // First character first
+  this->setRegister(QN_TX_RDSD5, block3.byteContent[0]);
+
+  this->setRegister(QN_TX_RDSD6, block4.byteContent[1]);
+  this->setRegister(QN_TX_RDSD7, block4.byteContent[0]);
+
+  this->rdsSetTxToggle();
+  this->rdsAsyncPending = true;
+}
+
+/**
+ * @ingroup group05 TX RDS
+ * @brief Non-blocking check for whether the chip has fetched the group sent via rdsSendGroupAsync().
+ * @details Does a single immediate RDS_TXUPD read - no delay(), no polling loop. Safe to call as
+ *          often as you like (e.g. every loop() iteration).
+ * @return true once the chip has fetched the last group sent via rdsSendGroupAsync() (or if
+ *         nothing is currently pending); false if it's still waiting to be fetched.
+ * @see rdsSendGroupAsync
+ */
+bool QN8066::rdsIsGroupSent() {
+  if (!this->rdsAsyncPending) return true;
+  if (this->rdsGetTxUpdated() != this->rdsAsyncToggle) {
+    this->rdsAsyncPending = false;
+    return true;
+  }
+  return false;
 }
 
 /**

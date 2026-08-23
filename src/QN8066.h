@@ -115,8 +115,8 @@ typedef union {
   struct {
     uint8_t tc : 1;       //!<  Pre-emphasis and de-emphasis time constant; 0 = 50; 1 = 75 
     uint8_t rdsrdy : 1;   //!<  RDS transmitting ready; - If user want the chip transmitting all the 8 bytes in RDS0~RDS7, user  should toggle this bit.
-    uint8_t tx_mute : 1;  //!<  TX audio mute enable - 0 = Mute Disabled; 1 = Mute Enabled; 
-    uint8_t rx_mute : 1;  //!<  RX audio mute enable - 0 = Mute Disabled; 1 = Mute Enabled
+    uint8_t tx_mute : 1;  //!<  TX audio mute enabel - 0 = Mute Disabled; 1 = Mute Enabled; 
+    uint8_t rx_mute : 1;  //!<  RX audio Mute enable - 0 = Mute Disabled; 1 = Mute Enabled
     uint8_t tx_mono : 1;  //!<  TX stereo and mono mode selection; 0 = Stereo;  1 = Mono
     uint8_t force_mo : 1; //!<  Force receiver in MONO mode; 0 = Not forced. ST/MONO auto selected; Forced in MONO mode
     uint8_t tx_rdsen : 1; //!<  Transmitter RDS enable; 0 = RDS Disable; 1 = RDS  Enable
@@ -136,7 +136,7 @@ typedef union {
 
 typedef union {
   struct {
-    uint8_t SNR_CCA_TH : 6; //!<  The threshold for determination of whether the current channel is valid by checking its SNR.
+    uint8_t SNR_CCA_TH : 6; //!<  The threshold for determination of whether  current channel is valid by check its SNR.
     uint8_t imr : 1;        //!<  Image Rejection. 0 = LO<RF, image is in lower side; 1 = LO>RF, image is in upper side
     uint8_t xtal_inj : 1;   //!<  Select the reference clock source. 0 = Inject sine-wave clock; 1 = Inject digital clock
   } arg;
@@ -201,7 +201,7 @@ typedef union {
 
 typedef union {
   struct {
-    uint8_t CID4 : 2; //!<  Sequential integer values from 0 to 4.
+    uint8_t CID4 : 2; //!<  Sequency integer values from 0 to 4.
     uint8_t CID3 : 6; //!<  Chip ID for product ID. 001101 = Transceiver –  QN8066; Others = Reserved unkown
   } arg;
   uint8_t raw;
@@ -444,7 +444,7 @@ typedef union {
 
 typedef union {
   struct {
-    uint8_t TXCH : 2; //!< Highest 2 bits of 10-bit channel index. Channel freq
+    uint8_t TXCH : 2; //!< Highest 2 bits of 10-bit channel index.  hannel freq
                       //!< is (60+TXCH*0.05)MHz
     uint8_t priv_mode : 1; //!< Private mode for RX/TX
     uint8_t
@@ -873,6 +873,9 @@ private:
   uint8_t rdsTP = 0;        //!< Traffic Program (TP)
   uint8_t rdsSendError = 0;
 
+  uint8_t rdsAsyncToggle = 0;      //!< RDS_TXUPD value captured when rdsSendGroupAsync() last wrote a group
+  bool    rdsAsyncPending = false; //!< true from rdsSendGroupAsync() until rdsIsGroupSent() confirms consumption
+
   char strRxCurrentFrequency[8];  // Stores formated current frequency
   uint16_t rxCurrentFrequency; 
   uint8_t  rxCurrentStep = 1;     //!<  current frequency step. Default is 100kHz
@@ -957,7 +960,6 @@ public:
   void setTxInputBufferGain(uint8_t value);
   void setTxSoftClippingEnable( bool value);
   void setTxSoftClipThreshold(uint8_t value);
-  void setTxFrequencyDerivation(uint8_t value);
   void setTxFrequencyDeviation(uint8_t value);
   
 
@@ -985,7 +987,7 @@ public:
 
   void setXtal(uint16_t divider, uint8_t xtalInj, uint8_t imageRejection);
 
-  void setPAC(uint8_t PA_TRGT);
+  void setPAC(uint8_t value);
   
   void setToggleTxPdClear();
 
@@ -1025,11 +1027,20 @@ public:
   void rdsTxEnable(bool value);   
   uint8_t rdsSetTxToggle();
   bool rdsGetTxUpdated();
-  void rdsSetFrequencyDerivation(uint8_t freq = 6);
+  void rdsSetFrequencyDeviation(uint8_t freq = 6);
   void rdsSetTxLineIn(bool value = 0); 
 
   void rdsSendGroup(RDS_BLOCK1 blockA, RDS_BLOCK2 blockB, RDS_BLOCK3 blockC, RDS_BLOCK4 blockD);
-  void rdsSendPS(char* ps = NULL); 
+
+  // Non-blocking counterpart to rdsSendGroup(): rdsSendGroupAsync() writes the group and returns
+  // immediately (no delay()/polling at all); call rdsIsGroupSent() as often as you like afterwards
+  // (e.g. once per loop() iteration) until it returns true, confirming the chip has fetched the
+  // group, before calling rdsSendGroupAsync() again with the next one. Lets the caller interleave
+  // other work (and prepare the next group's content) during the wait instead of blocking on it.
+  void rdsSendGroupAsync(RDS_BLOCK1 blockA, RDS_BLOCK2 blockB, RDS_BLOCK3 blockC, RDS_BLOCK4 blockD);
+  bool rdsIsGroupSent();
+
+  void rdsSendPS(char* ps = NULL);
 
 
   void rdsSetStationName(char *stationName);
