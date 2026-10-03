@@ -26,16 +26,24 @@
   Frequency/power/audio parameters (frequency, power, stereo/mono, pre-emphasis, frequency
   deviation, input impedance, buffer gain, soft clip) have no web form to change them any more -
   edit the constants below and re-flash for a permanent change, or override them at runtime with
-  a CFG line (see below). All RDS content (PI/PS/RT/PTY/TA/TP/MS/DI/PIN/AF/SLC/PTYN/Time) is set via
-  UECP as usual, same MECs as the WiFi variants.
+  a CFG line (see below). Likewise, this sketch's own boot-time RDS station-identity defaults
+  (PI/PS/RT/PTY/TA/TP/MS/DI - see the rdsDefault* constants below) can be edited and re-flashed for
+  a permanent change, so a station's identity is set the moment the board boots, with no CFG line
+  or UECP frame needed first; PIN/AF/SLC/PTYN/Time have no such per-sketch boot default (they start
+  at the shared library's own generic placeholders) and, like everything above, remain fully
+  reconfigurable at runtime via UECP as usual, same MECs as the WiFi variants.
 
   1. To connect: open a serial connection to this device at 115200 baud and send UECP frames
      (0xFE <SQC> <DSN/PSN elements...> 0xFF), one straight after another. No connection handshake
      is required - frames are parsed as they arrive.
-  2. UECP Site/Encoder address filtering: this device's own address defaults to 0/0 (accept every
-     frame regardless of address, per the UECP "all sites/all encoders" convention) - override at
-     runtime with a CFG line's SITE/ENC keys (see below), or edit uecpOurSite/uecpOurEncoder below
-     for a permanent default.
+  2. UECP Site/Encoder address filtering: this device's own address list(s) default to a single
+     0/0 entry (accept every frame regardless of address, per the UECP "all sites/all encoders"
+     convention) - override at runtime with a CFG line's SITE/ENC keys (see below), or edit
+     uecpOurAddress below for a permanent default. Per the UECP spec, an encoder may be configured
+     with more than one site address and more than one encoder address (e.g. a relay/repeater
+     serving several sites) - SITE/ENC each take a comma-separated list (e.g. SITE=1,2,3), up to
+     UECP_MAX_SITE_ADDRESSES/UECP_MAX_ENCODER_ADDRESSES (4/8) entries, replacing the whole
+     respective list each time the key is sent (see applyConfigLine() below).
   3. Pre-config line: some UECP sources never send every field (e.g. no MEC 0x01 for PI, or no
      DSN/PSN datasets/PIC assigned), and some values (this device's own DSN/PSN/site/encoder
      identity, and the boot frequency/power/audio parameters) have no UECP MEC of their own at
@@ -45,24 +53,16 @@
      present in the line are left untouched. A value containing a space must be quoted (e.g.
      PS="MY RADIO") - see nextCfgToken() below; unquoted values (most keys, which never contain a
      space anyway) work exactly as a bare KEY=VALUE token always has. Recognised keys: PI (hex),
-     DSN, PSN, SITE, ENC, POWER, FREQ, PTY, STEREO, PREEMPH, DERIV, IMPED, GAIN, SOFTCLIP (all
-     decimal except PI), and:
+     DSN, PSN, SITE, ENC (comma-separated lists, see point 2 above), POWER, FREQ, PTY, STEREO,
+     PREEMPH, DERIV, IMPED, GAIN, SOFTCLIP (all decimal except PI), and:
        - PS=text (e.g. PS="MY RADIO") - for a UECP source that never sends its own MEC 0x02.
          Applied exactly like a real MEC 0x02 (staged into psPending, not written to ps[] directly
          - see rds_state.h's psPending/psPendingValid comment).
        - RT=text (e.g. RT="MY RADIOTEXT STRING") - for a UECP source that never sends its own MEC
          0x0A. Replaces the whole RT buffer with this as the sole message 0, same as the WiFi
          sketches' own "rds_rt" web form field (see ESP32_WEB_QN8066.ino's handleUpdate()). Applied
-         immediately by default - unlike PS, RT's own A/B flag is what tells a receiver "content
-         changed", so an immediate, possibly mid-message switch is normally the spec-compliant way
-         RT updates propagate - unless RTBUF=1 (below) has turned on buffered mode, in which case
-         this stages instead and waits for a clean swap point.
-       - RTBUF=0|1 - "buffer RT" mode (see rds_state.h's rtBufferMode comment). 0 (default) is the
-         plain immediate RT replace described above. 1 defers any RT= (or MEC 0x0A clearing
-         replace) instead: staged into rtPending until the message currently playing has shown one
-         full pass through its own text, then swapped in cleanly by rds_scheduler.cpp's
-         buildGroup2A() - no receiver ever sees a message torn mid-transmission, at the cost of the
-         new text taking up to one full message cycle to actually appear.
+         immediately - unlike PS, RT's own A/B flag is what tells a receiver "content changed", so
+         an immediate, possibly mid-message switch is the spec-compliant way RT updates propagate.
        - ODA=AIDHEX:GROUPNUM[A|B] (e.g. ODA=CD46:8A) - manually maps an ODA AID to a group, both
          for Group 3A to announce as "master data" (see rds_state.h's odaManual[]/
          rds_scheduler.cpp's buildGroup3A()) and, via the same call, as a seed entry in the live
@@ -136,6 +136,33 @@ uint8_t  currentInputImpedance = 1;
 uint8_t  currentBufferGain    = 1;
 uint8_t  currentSoftClip      = 0;
 
+// --- Fixed boot-time RDS station-identity defaults (no web form in this variant - edit and
+// re-flash). Applied in setup(), right after rdsTxStateSetDefaults(uecpRdsState) (see below),
+// overriding the generic placeholder values that shared library call sets (rds_defaults.cpp, the
+// same one every sketch in this project calls) - same "edit the constant, re-flash" pattern as the
+// frequency/power/audio parameters above, just for RDS content instead of transmitter hardware
+// settings. Still fully reconfigurable afterwards at runtime exactly as before: a UECP frame (MEC
+// 0x01=PI, 0x02=PS, 0x0A=RT, 0x07=PTY, 0x03=TA/TP, 0x04=DI, 0x05=MS) or, for PI/PS/RT/PTY, a CFG
+// line (see applyConfigLine() below) - TA/TP/MS/DI have no CFG key of their own yet, only UECP.
+uint16_t rdsDefaultPI    = 0xCC66; // placeholder - set your station's real assigned PI code here
+const char* rdsDefaultPS = "*QN8066*";               // up to 8 chars; shorter values are space-padded
+const char* rdsDefaultRT = ""; // up to 64 chars; "" means no boot RT message
+                                                       // at all (see this value's own use in
+                                                       // setup() below) - rds_scheduler.cpp's
+                                                       // buildNextGroup() then won't build Group 2A
+                                                       // until a real one arrives, same as the
+                                                       // shared library's own boot default
+uint8_t  rdsDefaultPTY   = 0;      // Programme Type code (0 = undefined/none)
+bool     rdsDefaultTA    = false;  // Traffic Announcement
+bool     rdsDefaultTP    = true;   // Traffic Programme
+bool     rdsDefaultMusic = true;   // Music/Speech: true = Music, false = Speech
+bool     rdsDefaultStereo         = true;  // RDS DI Mono/Stereo flag - independent of
+                                             // currentStereoMono above, which is the chip's own
+                                             // actual audio encoding, not this RDS-advertised flag
+bool     rdsDefaultArtificialHead = false; // RDS DI Artificial Head flag
+bool     rdsDefaultCompressed     = false; // RDS DI Compressed flag
+bool     rdsDefaultDynamicPTY     = false; // RDS DI Dynamic PTY flag
+
 // Local Time setup - only used as a fallback Group 4A offset until a UECP MEC 0x0D Time message
 // has ever set uecpRdsState.ctOffset (see rds_scheduler.cpp's buildNextGroup()).
 const long gmtOffset_sec     = 7200;
@@ -180,10 +207,12 @@ OdaLiveDirectory odaLiveDir;
 // FF_FLAG_PRIORITY, so still first in line within that group's own queue).
 uint8_t pendingImmediateGroupIndex = FF_INDEX_NONE;
 
-// This device's own UECP address (site: 10 bits, encoder: 6 bits). 0/0 = accept every UECP frame
-// regardless of its address, per the UECP spec's "all sites"/"all encoders" convention.
-uint16_t uecpOurSite    = 0;
-uint8_t  uecpOurEncoder = 0;
+// This device's own UECP address(es) - see UecpAddressConfig's own comment in uecp_handler.h for
+// its default (a single 0/0 entry = accept every UECP frame regardless of its address) and how the
+// "SITE"/"ENC" CFG keys below populate it. The UECP spec allows an encoder more than one site
+// address and more than one encoder address, up to UECP_MAX_SITE_ADDRESSES/
+// UECP_MAX_ENCODER_ADDRESSES (4/8) each.
+UecpAddressConfig uecpOurAddress;
 
 // Boot-time default group sequence, copied into uecpRdsState.rdsSequence[]/rdsSequenceLen once in
 // setup() (see rdsTxStateSetDefaults()'s call site below). Editing these two constants and
@@ -282,9 +311,35 @@ void applyConfigLine(char* line) {
     } else if (strcmp(key, "PSN") == 0) {
       uecpRdsState.psn = (uint8_t) atoi(val);
     } else if (strcmp(key, "SITE") == 0) {
-      uecpOurSite = (uint16_t) atoi(val) & 0x03FF;
+      // Comma-separated list of decimal site addresses (e.g. SITE=1,2,3) - replaces the whole site
+      // address list wholesale, same "replace, don't append" convention as SEQ= below; up to
+      // UECP_MAX_SITE_ADDRESSES (4) entries, extras silently dropped. SITE=0 (the default) restores
+      // "accept every UECP frame regardless of its site address" - see UecpAddressConfig's own
+      // comment in uecp_handler.h and uecpAddressMatches() in uecp_handler.cpp for the exact rule
+      // once more than one address is configured.
+      uint16_t parsed[UECP_MAX_SITE_ADDRESSES];
+      uint8_t  n = parseUecpAddressList(val, parsed, UECP_MAX_SITE_ADDRESSES, 0x03FF, 10);
+      if (n == 0) {
+        Serial.println("CFG: SITE value had no valid entries, ignored");
+      } else {
+        memcpy(uecpOurAddress.sites, parsed, n * sizeof(uint16_t));
+        uecpOurAddress.siteCount = n;
+        Serial.printf("CFG SITE applied (%u address(es))\n", n);
+      }
+      continue;
     } else if (strcmp(key, "ENC") == 0) {
-      uecpOurEncoder = (uint8_t) atoi(val) & 0x3F;
+      // Comma-separated list of decimal encoder addresses (e.g. ENC=0,1) - same "replace wholesale"
+      // convention as SITE= above; up to UECP_MAX_ENCODER_ADDRESSES (8) entries.
+      uint16_t parsed[UECP_MAX_ENCODER_ADDRESSES];
+      uint8_t  n = parseUecpAddressList(val, parsed, UECP_MAX_ENCODER_ADDRESSES, 0x3F, 10);
+      if (n == 0) {
+        Serial.println("CFG: ENC value had no valid entries, ignored");
+      } else {
+        for (uint8_t i = 0; i < n; i++) uecpOurAddress.encoders[i] = (uint8_t) parsed[i];
+        uecpOurAddress.encoderCount = n;
+        Serial.printf("CFG ENC applied (%u address(es))\n", n);
+      }
+      continue;
     } else if (strcmp(key, "PTY") == 0) {
       uecpRdsState.pty = (uint8_t) atoi(val);
     } else if (strcmp(key, "POWER") == 0) {
@@ -339,39 +394,20 @@ void applyConfigLine(char* line) {
       // spaces, e.g. RT="MY RADIOTEXT STRING". A clearing replace of the whole RT buffer, becoming
       // the sole message 0 (any other slots are UECP-only territory) - mirrors the WiFi sketches'
       // own "rds_rt" web form field (see ESP32_WEB_QN8066.ino's handleUpdate()) and
-      // uecp_handler.cpp's uecpApplyRt(), including respecting rtBufferMode (see rds_state.h's own
-      // comment, and the RTBUF key below): buffered, this stages into rtPending instead of
-      // touching the live buffer, and rds_scheduler.cpp's buildGroup2A() swaps it in once the
-      // message currently playing has shown a full pass - unbuffered (the default), it's applied
-      // immediately, same as always, since RT's own A/B flag is the receiver-facing "content
-      // changed" signal and a torn mid-cycle transition is the spec-compliant way it's expected to
-      // propagate, unlike PS which has no such flag of its own.
-      if (uecpRdsState.rtBufferMode) {
-        memset(uecpRdsState.rtPending, 0, sizeof(uecpRdsState.rtPending));
-        uecpRdsState.rtPending[0].textLen     = (uint8_t) utf8ToEbu(val, uecpRdsState.rtPending[0].text, RDS_RT_MAX_LEN);
-        uecpRdsState.rtPending[0].repeatCount = 0; // infinite
-        uecpRdsState.rtPending[0].toggleAB    = true;
-        uecpRdsState.rtPendingCount           = 1;
-        uecpRdsState.rtPendingValid           = true;
-        Serial.printf("CFG RT=\"%s\" applied (staged, takes effect once the current message finishes)\n", val);
-      } else {
-        memset(uecpRdsState.rt, 0, sizeof(uecpRdsState.rt));
-        uecpRdsState.rt[0].textLen     = (uint8_t) utf8ToEbu(val, uecpRdsState.rt[0].text, RDS_RT_MAX_LEN);
-        uecpRdsState.rt[0].repeatCount = 0; // infinite
-        uecpRdsState.rt[0].toggleAB    = true;
-        uecpRdsState.rtCount           = 1;
-        uecpRdsState.rtCurrent         = 0;
-        uecpRdsState.rtSegment         = 0;
-        uecpRdsState.rtRepeatsDone     = 0;
-        uecpRdsState.rtABFlag          = !uecpRdsState.rtABFlag;
-        Serial.printf("CFG RT=\"%s\" applied\n", val);
-      }
+      // uecp_handler.cpp's uecpApplyRt() - applied immediately, since RT's own A/B flag is the
+      // receiver-facing "content changed" signal and a torn mid-cycle transition is the
+      // spec-compliant way it's expected to propagate, unlike PS which has no such flag of its own.
+      memset(uecpRdsState.rt, 0, sizeof(uecpRdsState.rt));
+      uecpRdsState.rt[0].textLen     = (uint8_t) utf8ToEbu(val, uecpRdsState.rt[0].text, RDS_RT_MAX_LEN);
+      uecpRdsState.rt[0].repeatCount = 0; // infinite
+      uecpRdsState.rt[0].toggleAB    = true;
+      uecpRdsState.rtCount           = 1;
+      uecpRdsState.rtCurrent         = 0;
+      uecpRdsState.rtSegment         = 0;
+      uecpRdsState.rtRepeatsDone     = 0;
+      uecpRdsState.rtABFlag          = !uecpRdsState.rtABFlag;
+      Serial.printf("CFG RT=\"%s\" applied\n", val);
       continue;
-    } else if (strcmp(key, "RTBUF") == 0) {
-      // Toggles rtBufferMode (see rds_state.h's own comment) - 0 (default) is the original instant
-      // RT replace, 1 is the deferred "clean" swap. Falls through to the generic "applied" log
-      // below rather than doing its own, same as every other plain on/off or numeric key here.
-      uecpRdsState.rtBufferMode = (atoi(val) != 0);
     } else if (strcmp(key, "ODA") == 0) {
       // Manually configure one ODA AID -> group mapping (see rds_state.h's odaManual[] and
       // buildGroup3A()), and seed the same mapping into the live directory (oda_directory.h) so
@@ -479,7 +515,7 @@ void handleSerialInput() {
     } else if (b == 0xFF && uecpInPacket) {
       uecpInPacket = false;
       processUecpFrame(uecpBuf, uecpBufLen, "USB", uecpRdsState, ffPool, odaLiveDir,
-                       pendingImmediateGroupIndex, uecpOurSite, uecpOurEncoder);
+                       pendingImmediateGroupIndex, uecpOurAddress);
       uecpBufLen = 0;
     } else if (uecpInPacket) {
       if (uecpBufLen < UECP_MAX_FRAME) {
@@ -507,6 +543,40 @@ void setup() {
   Serial.begin(115200);
 
   rdsTxStateSetDefaults(uecpRdsState);
+
+  // Apply this sketch's own RDS station-identity defaults (see the rdsDefault* constants above),
+  // overriding the generic library placeholders rdsTxStateSetDefaults() just set. Written directly
+  // into uecpRdsState (not the psPending staging area MEC 0x02 and CFG PS= use)
+  // since this runs before rdsSchedulerStart() below has ever transmitted anything - there's no
+  // "torn mid-cycle" receiver to protect against yet, exactly like rdsTxStateSetDefaults() itself
+  // writes state.ps[]/state.rt[] directly.
+  uecpRdsState.pi[0] = (uint8_t)(rdsDefaultPI >> 8);
+  uecpRdsState.pi[1] = (uint8_t)(rdsDefaultPI & 0xFF);
+  {
+    uint8_t psEbu[RDS_PS_LEN];
+    memset(psEbu, ' ', RDS_PS_LEN); // pad short values with spaces, same as applyConfigLine()'s PS= key
+    utf8ToEbu(rdsDefaultPS, psEbu, RDS_PS_LEN);
+    memcpy(uecpRdsState.ps, psEbu, RDS_PS_LEN);
+  }
+  // rtCount is only set to 1 below if rdsDefaultRT actually converts to some real text - an empty
+  // string (see rdsDefaultRT's own comment above) leaves it at 0 (rdsTxStateSetDefaults()'s own
+  // boot default), so rds_scheduler.cpp's buildNextGroup() won't build Group 2A until a real RT
+  // message arrives via UECP/CFG/web, same as the shared library's own "no RT configured" state.
+  {
+    RtMessage& msg  = uecpRdsState.rt[0];
+    msg.textLen     = (uint8_t) utf8ToEbu(rdsDefaultRT, msg.text, RDS_RT_MAX_LEN);
+    msg.repeatCount = 0; // loop forever
+    msg.toggleAB    = false;
+    uecpRdsState.rtCount   = (msg.textLen > 0) ? 1 : 0;
+    uecpRdsState.rtCurrent = 0;
+    uecpRdsState.rtSegment = 0;
+  }
+  uecpRdsState.pty    = rdsDefaultPTY;
+  uecpRdsState.tatp   = (rdsDefaultTA ? 0x01 : 0x00) | (rdsDefaultTP ? 0x02 : 0x00);
+  uecpRdsState.ms     = rdsDefaultMusic ? 0x01 : 0x00;
+  uecpRdsState.diPtyi = (rdsDefaultStereo ? 0x01 : 0x00) | (rdsDefaultArtificialHead ? 0x02 : 0x00) |
+                        (rdsDefaultCompressed ? 0x04 : 0x00) | (rdsDefaultDynamicPTY ? 0x08 : 0x00);
+
   // Seed the live, runtime-mutable group sequence from this sketch's own boot default - see
   // RDS_SEQUENCE's own comment above. rdsTxStateSetDefaults() itself leaves these zeroed (it has
   // no sketch-specific sequence of its own to default to), so this is the .ino's own job, same as

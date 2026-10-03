@@ -225,7 +225,10 @@ static RdsGroupBlocks buildGroup1B(RdsTxState& state) {
   return g;
 }
 
-// Group 2A - Radio Text. Struct-backed fallback for group index 4.
+// Group 2A - Radio Text. Struct-backed fallback for group index 4; only called when
+// buildNextGroup()'s own dispatch gate has already confirmed state.rtCount > 0, so
+// state.rt[state.rtCurrent] below is always a real message - never reached while genuinely nothing
+// has ever been configured.
 static RdsGroupBlocks buildGroup2A(RdsTxState& state) {
   RdsGroupBlocks g;
   fillCommonBlock1(g, state);
@@ -250,26 +253,7 @@ static RdsGroupBlocks buildGroup2A(RdsTxState& state) {
   else                    totalSegs = (msg.textLen / 4) + 1;
   if (++state.rtSegment >= totalSegs) {
     state.rtSegment = 0;
-    if (state.rtPendingValid) {
-      // "Buffer RT" swap (see rds_state.h's rtBufferMode comment) - the message that was playing
-      // has now shown one full pass, so it's safe to swap in the staged content without tearing
-      // anything mid-message. Bypasses the ordinary repeat/rotation bookkeeping below entirely:
-      // rtCurrent/rtRepeatsDone are reset fresh for the swapped-in content, and falling through to
-      // that bookkeeping afterwards would immediately re-advance them before message 0 of the new
-      // content has even been shown once.
-      memcpy(state.rt, state.rtPending, sizeof(state.rt));
-      state.rtCount       = state.rtPendingCount;
-      state.rtCurrent     = 0;
-      state.rtRepeatsDone = 0;
-      // Same toggleAB/rtSeeded convention as a live, non-buffered MEC 0x0A arrival - see
-      // uecpApplyRt()'s own comment on why the very first real message is exempt.
-      if (!state.rtSeeded) {
-        state.rtSeeded = true;
-      } else if (state.rt[0].toggleAB) {
-        state.rtABFlag = !state.rtABFlag;
-      }
-      state.rtPendingValid = false;
-    } else if (state.rtCount <= 1) {
+    if (state.rtCount <= 1) {
       if (msg.repeatCount != 0 && state.rtRepeatsDone < msg.repeatCount) {
         state.rtRepeatsDone++;
       }
@@ -346,17 +330,19 @@ static RdsGroupBlocks buildGenericGroup(const RdsTxState& state, uint8_t groupTy
 // state.rdsSequence; guarded by ffHasContent() defensively (it should always still be there - this
 // runs well within microseconds of the enqueue that set it - but never trust that blindly).
 // Otherwise walk state.rdsSequence: for whichever group index comes up, free-format content (if
-// any is queued for it) always wins over this project's own struct-backed groups; 0/2/4/20 (0A/1A/
-// 2A/10A) always have struct fallback content, and 6 (3A) and 30 (15A) have it conditionally (3A
-// only once at least one manual ODA mapping is configured - see buildGroup3A(); 15A only once a
-// long PS has actually been set OR one is staged and waiting - see buildGroup15A() - the latter
-// so the very first long PS ever received isn't stuck waiting on a chicken-and-egg dispatch gate
-// that only buildGroup15A() itself, once reachable, can clear); any *other* index with nothing
-// queued is quietly skipped - the loop tries the next sequence slot immediately rather than
-// transmitting nothing, keeping the on-air group rate constant. Bounded to one full lap of the
-// sequence so a pathological all-empty sequence still terminates rather than looping forever
-// (falls back to Group 0A, which - being in every sketch's own default sequence - shouldn't
-// normally be reachable).
+// any is queued for it) always wins over this project's own struct-backed groups; 0/2/20 (0A/1A/
+// 10A) always have struct fallback content, and 4 (2A), 6 (3A) and 30 (15A) have it conditionally
+// (2A only once state.rt[] actually holds a message - see buildGroup2A() and rtCount's own comment
+// in rds_state.h; 3A only once at least one manual ODA mapping is configured - see buildGroup3A();
+// 15A only once a long PS has actually been set OR one is staged and waiting - see
+// buildGroup15A()) - for 15A, the "staged and waiting" half of the check exists so the very first
+// real update ever received isn't stuck waiting on a chicken-and-egg dispatch gate that only the
+// group's own build function, once reachable, can clear; any *other* index with nothing queued is
+// quietly skipped - the loop tries
+// the next sequence slot immediately rather than transmitting nothing, keeping the on-air group
+// rate constant. Bounded to one full lap of the sequence so a pathological all-empty sequence
+// still terminates rather than looping forever (falls back to Group 0A, which - being in every
+// sketch's own default sequence - shouldn't normally be reachable).
 static RdsGroupBlocks buildNextGroup(QN8066& tx, RdsTxState& state, FreeFormatPool& ffPool,
                                      uint8_t& pendingImmediateGroupIndex, uint8_t fallbackOffsetByte) {
   time_t now       = time(nullptr);
@@ -409,7 +395,7 @@ static RdsGroupBlocks buildNextGroup(QN8066& tx, RdsTxState& state, FreeFormatPo
 
     if (groupIndex == 0)  return buildGroup0A(state);
     if (groupIndex == 2)  return buildGroup1A(state);
-    if (groupIndex == 4)  return buildGroup2A(state);
+    if (groupIndex == 4 && state.rtCount > 0) return buildGroup2A(state);
     if (groupIndex == 6 && state.odaManualCount > 0) return buildGroup3A(state);
     if (groupIndex == 20) return buildGroup10A(state);
     if (groupIndex == 30 && (state.longPsLen > 0 || state.longPsPendingValid)) return buildGroup15A(state);

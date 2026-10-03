@@ -18,6 +18,35 @@ static uint16_t uecpCrc16(const uint8_t* data, uint16_t len) {
   return 0xFFFF - crc;
 }
 
+// True if a UECP frame's ADD field (addr: 10-bit site address <<6 | 6-bit encoder address, as
+// packed in the frame header) should be accepted by this device, given its own configured
+// site/encoder address list(s) (ourAddress - see UecpAddressConfig's own comment in
+// uecp_handler.h). Matching rule, preserved from this project's original single-address behaviour
+// and generalized to multiple addresses (per the UECP spec, an encoder may be configured with more
+// than one site address and more than one encoder address): a frame addressed 0x0000 ("all
+// sites/all encoders", the UECP spec's own convention) always matches; this device's own default
+// policy - exactly one site address and one encoder address configured, both 0 - means it accepts
+// every frame regardless of address; otherwise, the frame's address must exactly equal one of this
+// device's own (site, encoder) combinations - every configured site paired with every configured
+// encoder, since the spec doesn't tie a particular site to a particular encoder, so any pairing
+// counts as a match.
+static bool uecpAddressMatches(uint16_t addr, const UecpAddressConfig& ourAddress) {
+  if (ourAddress.siteCount == 1 && ourAddress.sites[0] == 0 &&
+      ourAddress.encoderCount == 1 && ourAddress.encoders[0] == 0) {
+    return true; // default policy - accept everything
+  }
+  if (addr == 0) return true; // frame's own "all sites/all encoders" wildcard
+
+  for (uint8_t s = 0; s < ourAddress.siteCount; s++) {
+    uint16_t sitePart = (uint16_t)((ourAddress.sites[s] & 0x03FF) << 6);
+    for (uint8_t e = 0; e < ourAddress.encoderCount; e++) {
+      uint16_t combined = (uint16_t)(sitePart | (ourAddress.encoders[e] & 0x3F));
+      if (addr == combined) return true;
+    }
+  }
+  return false;
+}
+
 // Byte de-stuffing (unescape_uecp in uecp_mp2.py).
 // 0xFD is the escape byte; the byte that follows has 0xFD added back to recover
 // the original value (0xFD→0xFD 0x00, 0xFE→0xFD 0x01, 0xFF→0xFD 0x02).
@@ -100,18 +129,28 @@ static void uecpApplyMec(uint8_t mec, const uint8_t* data, RdsTxState& state) {
   }
 }
 
-// Applies one already DSN/PSN-matched RT (MEC 0x0A) element. Unless state.rtBufferMode is set, a
-// clearing replace is applied immediately - no staging - since the RDS spec's own text-A/B flag
-// already gives receivers a clean "content changed" signal, so a torn mid-cycle transition is the
-// expected, spec-compliant way RT updates propagate (as long as the source toggles the A/B bit
-// correctly). With rtBufferMode set, a clearing replace is staged into rtPending instead and
-// swapped in later by rds_scheduler.cpp's buildGroup2A() - see rds_state.h's rtBufferMode comment.
+// Applies one already DSN/PSN-matched RT (MEC 0x0A) element. A clearing replace is applied
+// immediately - no staging - since the RDS spec's own text-A/B flag already gives receivers a clean
+// "content changed" signal, so a torn mid-cycle transition is the expected, spec-compliant way RT
+// updates propagate (as long as the source toggles the A/B bit correctly). Making sure each message
+// is shown at least once before the next one replaces it is the group sequence's job (enough 2A
+// slots for the source's RT change rate), not this function's.
 //
 // medByte layout, MSB(bit7) to LSB(bit0): bit7 unused; bits6-5 buffer config (00 = clear the whole
 // RT_BUFFER then insert this as the sole message; anything else = append to the end, silently
 // dropped if RDS_RT_BUFFER_SIZE would overflow - the spec defines further insert modes we don't
 // yet distinguish, so they fall into the same "append" bucket rather than being rejected); bits4-1
 // repeat count (0-15, maps directly to RtMessage::repeatCount); bit0 toggleAB.
+//
+// textLen == 0 together with a clearing medByte (bits6-5 == 00) means "clear the RT buffer, no
+// replacement text" - processUecpFrame()'s own MEC 0x0A dispatch reaches this both via MEL==0 (no
+// medByte/text at all; it synthesizes medByte=0x00 itself) and via MEL==1 with clear-bits and no
+// text byte beyond the medByte. Either way, the buffer is left genuinely empty (rtCount at 0, no
+// message stored) rather than storing one message whose text happens to be
+// empty, so rds_scheduler.cpp's buildNextGroup() stops building Group 2A entirely (see its own
+// groupIndex==4 dispatch gate) until real RT text arrives - see rtCount's own comment in
+// rds_state.h.
+//
 // Returns false if the message was dropped (buffer full) rather than applied, so the caller can
 // log accurately instead of claiming "applied" for a silent drop.
 static bool uecpApplyRt(uint8_t medByte, const uint8_t* text, uint16_t textLen, RdsTxState& state) {
@@ -121,61 +160,55 @@ static bool uecpApplyRt(uint8_t medByte, const uint8_t* text, uint16_t textLen, 
   uint8_t repeatCount = (medByte >> 1) & 0x0F;
   bool    toggleAB    = (medByte & 0x01) != 0;
 
-  // Which buffer this element actually lands in. A clearing replace starts a fresh buffer - live
-  // if rtBufferMode is off, staged into rtPending if it's on (see rds_state.h's rtBufferMode
-  // comment). An append continues whichever buffer is currently "the future": if a buffered clear
-  // is already staged and waiting (rtPendingValid), an append has to land in rtPending too, or it
-  // would be silently lost the moment that staged clear finally swaps in and overwrites the live
-  // buffer wholesale - otherwise (rtBufferMode off, or on but nothing staged yet) it applies
-  // straight to the live buffer as always, since an append never disturbs what's currently playing
-  // regardless of the mode.
-  bool       buffered = state.rtBufferMode && (clearBuffer || state.rtPendingValid);
-  RtMessage* buf   = buffered ? state.rtPending       : state.rt;
-  uint8_t*   count = buffered ? &state.rtPendingCount : &state.rtCount;
-
   uint8_t slot;
   if (clearBuffer) {
-    memset(buf, 0, sizeof(RtMessage) * RDS_RT_BUFFER_SIZE); // rt[]/rtPending[] are the same size
-    slot = 0;
-    if (buffered) {
-      state.rtPendingValid = true;
-    } else {
-      state.rtCurrent     = 0;
-      state.rtSegment     = 0;
-      state.rtRepeatsDone = 0;
+    memset(state.rt, 0, sizeof(state.rt));
+    slot                = 0;
+    state.rtCount       = 0; // genuinely empty unless a message actually gets stored below
+    state.rtCurrent     = 0;
+    state.rtSegment     = 0;
+    state.rtRepeatsDone = 0;
 
-      // Every real UECP arrival honors its own toggleAB bit unconditionally, even if the text is
-      // byte-for-byte identical to what's already there - "don't toggle on a repeat" refers only to
-      // the scheduler's own internal repeat/loop cycling (replaying the same stored message's
-      // segments, or looping it repeatCount times), which never calls this function at all since no
-      // new UECP frame arrived. The one exception is the very first real message ever: the boot
-      // placeholder it's replacing was never part of a genuine broadcast toggle lineage, so nothing
-      // meaningful exists to flip relative to - rtABFlag is left exactly as it already is (0, from
-      // the boot default) rather than being derived from this first message's bit at all. A
-      // buffered clear (above) goes through this same "first real message" exemption too, just
-      // later - see buildGroup2A()'s swap-in, which checks rtSeeded/toggleAB the same way once the
-      // staged content actually takes effect.
-      if (!state.rtSeeded) {
-        state.rtSeeded = true;
-      } else if (toggleAB) {
-        state.rtABFlag = !state.rtABFlag;
-      }
+    if (textLen == 0) {
+      // Clear-only, no replacement text (see this function's own comment above) - rtCount stays 0.
+      // RT is now paused - reset rtSeeded so the next real message that arrives is once again
+      // treated as "first after a pause" (see rtSeeded's own comment below and in rds_state.h) and
+      // forced onto the A position, rather than toggling relative to whatever rtABFlag happened to
+      // be left at before this pause.
+      state.rtSeeded = false;
+      return true;
+    }
+
+    // Every real UECP arrival honors its own toggleAB bit unconditionally, even if the text is
+    // byte-for-byte identical to what's already there - "don't toggle on a repeat" refers only to
+    // the scheduler's own internal repeat/loop cycling (replaying the same stored message's
+    // segments, or looping it repeatCount times), which never calls this function at all since no
+    // new UECP frame arrived. The one exception is the very first real message after a pause -
+    // boot, or an earlier clear-with-no-text (see above): there's nothing meaningful yet to flip
+    // relative to, so rtABFlag is forced to false (the A position) outright rather than being
+    // derived from this message's own bit at all - "leave it unchanged" isn't enough here, since a
+    // prior run could have left it at B.
+    if (!state.rtSeeded) {
+      state.rtSeeded = true;
+      state.rtABFlag = false;
+    } else if (toggleAB) {
+      state.rtABFlag = !state.rtABFlag;
     }
   } else {
-    if (*count >= RDS_RT_BUFFER_SIZE) return false; // buffer full - drop, per the MED spec's own convention
-    slot = *count;
-    // Appending doesn't "start" transmission of anything yet, whether it lands live or staged - the
-    // scheduler's own rotation (buildGroup2A()'s rtCurrent/rtRepeatsDone cycling) will reach this
-    // slot in due course once the messages ahead of it have each been shown their configured
-    // repeatCount times, so the live A/B flag isn't touched here either way.
+    if (state.rtCount >= RDS_RT_BUFFER_SIZE) return false; // buffer full - drop, per the MED spec's own convention
+    slot = state.rtCount;
+    // Appending doesn't "start" transmission of anything yet - the scheduler's own rotation
+    // (buildGroup2A()'s rtCurrent/rtRepeatsDone cycling) will reach this slot in due course once
+    // the messages ahead of it have each been shown their configured repeatCount times, so the
+    // live A/B flag isn't touched here.
   }
 
-  RtMessage& msg = buf[slot];
+  RtMessage& msg = state.rt[slot];
   memcpy(msg.text, text, textLen);
   msg.textLen     = (uint8_t)textLen;
   msg.repeatCount = repeatCount;
   msg.toggleAB    = toggleAB;
-  *count = slot + 1;
+  state.rtCount = slot + 1;
   return true;
 }
 
@@ -208,9 +241,9 @@ static bool uecpApplyAf(const uint8_t* medBytes, const uint8_t* afData, uint16_t
 // comment). Always staged into longPsPending/longPsPendingLen/longPsPendingValid and swapped into
 // longPs/longPsLen later by rds_scheduler.cpp's buildGroup15A() once its segment counter wraps back
 // to 0 - same clean-swap convention as PS's own psPending/psPendingValid, applied unconditionally
-// (unlike RT's optional rtBufferMode): long PS has no A/B flag of its own to signal "content
+// (unlike RT, which is never staged): long PS has no A/B flag of its own to signal "content
 // changed" to a receiver, so unlike RT there's no spec-sanctioned "torn transition is fine" case to
-// default to - staging is the only sane behaviour here, not an opt-in.
+// fall back on - staging is the only sane behaviour here.
 static void uecpApplyLongPs(const uint8_t* data, uint8_t dataLen, RdsTxState& state) {
   if (dataLen > RDS_LONG_PS_MAX_LEN) dataLen = RDS_LONG_PS_MAX_LEN; // defensive cap; never trust length data blindly
   memcpy(state.longPsPending, data, dataLen);
@@ -413,19 +446,23 @@ static void applyOdaDirectGroupData(FreeFormatPool& ffPool, const OdaLiveDirecto
 // DSN/PSN-matched walk, plus RT (MEC 0x0A), AF (MEC 0x13), and Long PS (MEC 0x21) as special
 // MEL-bearing cases, and Time (MEC 0x0D) / group sequence (MEC 0x16, DSN-only) / SLC (MEC 0x1A, DSN-only) / group
 // variant sequence (MEC 0x29, DSN-only) /
-// Free-Format Group (MEC 0x24) / MEC 0x40 (ODA AID/group definition, an alternate encoding of a
-// Group 3A definition) / TMC (MEC 0x30) / MEC 0x46 (ODA data) as special no-DSN/PSN-at-all cases
-// (0x24/0x40 fixed-length, 0x30/0x46 MEL-bearing like RT/AF); any other MEC encountered stops the
-// walk (see uecpMecDataLen()'s comment). MEC 0x24 targeting Group 3A, MEC 0x40, and MEC 0x46's
-// MEL==5 case all funnel into applyGroup3ADefinition(); MEC 0x46's MEL==8/6 cases funnel into
-// applyOdaDirectGroupData() - see both functions' own comments and oda_directory.h. A frame that
-// fails CRC gets a full hex dump so the failure is inspectable.
+// Free-Format Group (MEC 0x24) / IH (MEC 0x25 - like MEC 0x24 but fixed to Group 6A/6B, the same
+// way TMC below is fixed to Group 8A) / MEC 0x40 (ODA AID/group definition, an alternate encoding
+// of a Group 3A definition) / MEC 0x42 (ODA Free-Format Group - like MEC 0x24 but Group 3B and
+// above only, with MEC 0x46's richer priority/buffer-config Config byte) / TMC (MEC 0x30) / MEC
+// 0x46 (ODA data) as special no-DSN/PSN-at-all cases (0x24/0x25/0x40/0x42 fixed-length, 0x30/0x46
+// MEL-bearing like RT/AF); any other MEC encountered stops the walk (see uecpMecDataLen()'s
+// comment). MEC 0x24 targeting Group 3A, MEC 0x40, and MEC 0x46's MEL==5 case all funnel into
+// applyGroup3ADefinition(); MEC 0x46's MEL==8/6 cases funnel into applyOdaDirectGroupData() (MEC
+// 0x42 uses neither - it never targets Group 3A/AIDs at all, just ffEnqueue()/ffClearGroup()
+// directly) - see both functions' own comments and oda_directory.h. A frame that fails CRC gets a
+// full hex dump so the failure is inspectable.
 // ---------------------------------------------------------------------------
 
 void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
                       const String& clientIp, RdsTxState& state, FreeFormatPool& ffPool,
                       OdaLiveDirectory& odaLiveDir, uint8_t& pendingImmediateGroupIndex,
-                      uint16_t ourSiteAddress, uint8_t ourEncoderAddress) {
+                      const UecpAddressConfig& ourAddress) {
   // 1. De-stuff
   uint8_t  destuffed[UECP_MAX_FRAME];
   uint16_t dLen = uecpDestuff(rawInner, rawLen, destuffed);
@@ -446,15 +483,14 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
   }
 
   // 3. Address filter. ADD is the first 2 destuffed bytes (MSB first): site address (10 bits,
-  // most significant) + encoder address (6 bits, least significant). Two independent wildcards,
-  // per the UECP spec plus this project's own default policy: a frame addressed 0x0000 ("all
-  // sites/all encoders") always matches, AND our own address defaulting to 0x0000 means we match
-  // every frame regardless of its address. Otherwise the two must match exactly.
-  uint16_t addr    = ((uint16_t)destuffed[0] << 8) | destuffed[1];
-  uint16_t ourAddr = (uint16_t)(((ourSiteAddress & 0x03FF) << 6) | (ourEncoderAddress & 0x3F));
-  if (addr != 0 && ourAddr != 0 && addr != ourAddr) {
-    Serial.printf("UECP frame from %s ignored (address 0x%04X, ours is 0x%04X)\n",
-                  clientIp.c_str(), addr, ourAddr);
+  // most significant) + encoder address (6 bits, least significant). See uecpAddressMatches()'s own
+  // comment above for the exact matching rule, now that this device can be configured with more
+  // than one site address and more than one encoder address.
+  uint16_t addr = ((uint16_t)destuffed[0] << 8) | destuffed[1];
+  if (!uecpAddressMatches(addr, ourAddress)) {
+    Serial.printf("UECP frame from %s ignored (address 0x%04X doesn't match any of our %u site/%u "
+                  "encoder address(es))\n", clientIp.c_str(), addr,
+                  (unsigned)ourAddress.siteCount, (unsigned)ourAddress.encoderCount);
     return;
   }
 
@@ -500,7 +536,27 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       uint8_t  psn   = destuffed[pos + 2];
       uint8_t  mel   = destuffed[pos + 3];
       uint16_t base  = pos + 4;
-      if (mel == 0 || (uint16_t)(base + mel) > msgEnd) {
+
+      if (mel == 0) {
+        // A valid "clear the RT buffer, no replacement text" signal, not a truncated element -
+        // MEC+DSN+PSN+MEL only, with no medByte and no text at all (see uecpApplyRt()'s own
+        // comment). Synthesizes medByte=0x00 (clearing bits, no repeat, no toggle - there's no
+        // real byte to read any of those from).
+        bool dsnMatches = uecpDsnMatches(dsn, state);
+        bool psnMatches = (psn == 0 || state.psn == 0 || psn == state.psn);
+        if (dsnMatches && psnMatches) {
+          uecpApplyRt(0x00, nullptr, 0, state);
+          Serial.printf("UECP applied MEC 0x0A RT clear (DSN=%u PSN=%u, no replacement text) from %s\n",
+                        dsn, psn, clientIp.c_str());
+        } else {
+          Serial.printf("UECP MEC 0x0A from %s ignored (DSN=%u PSN=%u, ours is %u/%u)\n",
+                        clientIp.c_str(), dsn, psn, state.dsn, state.psn);
+        }
+        pos = base;
+        continue;
+      }
+
+      if ((uint16_t)(base + mel) > msgEnd) {
         Serial.printf("UECP RT element (MEL=%u) truncated from %s\n", mel, clientIp.c_str());
         break;
       }
@@ -767,6 +823,65 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       continue;
     }
 
+    if (mec == 0x25) {
+      // IH (In-House) - a narrower cousin of MEC 0x24 Free-Format Group: no DSN/PSN, no MEL -
+      // always exactly MEC[1]+Group[1]+MED[1]+Data[4] = 7 bytes, the same fixed shape as MEC 0x24.
+      // The only real difference is the Group byte: IH is always RDS Group 6 (In-House
+      // Applications), so instead of MEC 0x24's groupType<<1|versionB packing, this byte is just
+      // 0x00=Group 6A / 0x01=Group 6B. Same MED mode bits (bit7 reserved, bits6-5 buffer config,
+      // bits4-0 = block2's last 5 bits) and same three modes (0b00 one-shot, 0b10 cyclic, 0b11
+      // clear) as MEC 0x24 - mirrors its handling above, just fixed to Group 6A/6B instead of a
+      // Group byte-selected target, the same way MEC 0x30 TMC below mirrors it fixed to Group 8A.
+      if ((uint16_t)(pos + 7) > msgEnd) {
+        Serial.printf("UECP IH element truncated from %s\n", clientIp.c_str());
+        break;
+      }
+      uint8_t  groupByte = destuffed[pos + 1];
+      uint8_t  medByte   = destuffed[pos + 2];
+      uint16_t block3    = ((uint16_t)destuffed[pos + 3] << 8) | destuffed[pos + 4];
+      uint16_t block4    = ((uint16_t)destuffed[pos + 5] << 8) | destuffed[pos + 6];
+
+      // Only bit0 is defined (0=6A, 1=6B) - any other bit set is undefined per spec, same "nearest
+      // safe bucket" precedent as MEC 0x24/0x30/0x40's own undefined codes.
+      bool    versionB    = (groupByte & 0x01) != 0;
+      uint8_t groupIndex  = ffGroupIndex(6, versionB);
+      uint8_t mode        = (medByte >> 5) & 0x03; // bits6-5; bit7 is unused/ignored per spec
+      uint8_t block2Last5 = medByte & 0x1F;
+
+      if (mode == 0b11) {
+        ffClearGroup(ffPool, groupIndex);
+        Serial.printf("UECP applied MEC 0x25 IH (Group 6%c) buffer cleared from %s\n",
+                      versionB ? 'B' : 'A', clientIp.c_str());
+      } else if (!rdsSequenceHasGroup(state, groupIndex)) {
+        // See rdsSequenceHasGroup()'s own comment - Group 6A/6B has no struct fallback of its own
+        // (unlike 0A/1A/2A/10A), so if it's not in the current sequence at all, nothing would ever
+        // dequeue this element, and it would just sit in the pool taking up a slot forever.
+        Serial.printf("UECP MEC 0x25 IH (Group 6%c) from %s dropped: that group isn't in the "
+                      "current group sequence, so it would never be sent\n",
+                      versionB ? 'B' : 'A', clientIp.c_str());
+      } else {
+        // mode 0b10 = cyclic; 0b00 = one-shot; the spec leaves 0b01 undefined - treated as
+        // one-shot too, same precedent as MEC 0x24.
+        bool cyclic = (mode == 0b10);
+        FfEnqueueResult result = ffEnqueue(ffPool, groupIndex, block2Last5, block3, block4, cyclic);
+        if (result != FF_ENQUEUE_FAILED) {
+          if (result == FF_ENQUEUE_OK_CLEARED) {
+            Serial.printf("UECP MEC 0x25 IH (Group 6%c): buffer was full - cleared it to make room "
+                          "for this message instead of dropping it; consider giving Group 6%c more "
+                          "airtime in the group sequence if this keeps happening\n",
+                          versionB ? 'B' : 'A', versionB ? 'B' : 'A');
+          }
+          Serial.printf("UECP applied MEC 0x25 IH (Group 6%c, %s) from %s\n",
+                        versionB ? 'B' : 'A', cyclic ? "cyclic" : "one-shot", clientIp.c_str());
+        } else {
+          Serial.printf("UECP MEC 0x25 IH (Group 6%c) from %s dropped (free-format pool full)\n",
+                        versionB ? 'B' : 'A', clientIp.c_str());
+        }
+      }
+      pos += 7;
+      continue;
+    }
+
     if (mec == 0x40) {
       // Another way to signal a Group 3A ODA AID/group definition (alongside MEC 0x24 sent
       // directly for Group 3A) - no DSN/PSN, no MEL: always exactly
@@ -804,6 +919,89 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       if (timeoutMinutes != 0) {
         Serial.printf("UECP MEC 0x40 (AID 0x%04X) requested a %u-minute ODA data timeout - not "
                       "yet implemented, ignored\n", aid, timeoutMinutes);
+      }
+      pos += 8;
+      continue;
+    }
+
+    if (mec == 0x42) {
+      // ODA Free-Format Group - applies data straight to a specific RDS group (the Group byte, per
+      // usual 4-bit-type + A/B-bit packing), not to an AID like MEC 0x46 does - closer in spirit to
+      // MEC 0x24, just with MEC 0x46's richer Config byte (priority + buffer config) instead of
+      // MEC 0x24's plainer 2-bit mode field. No DSN/PSN, no MEL: always exactly
+      // MEC[1]+Group[1]+Config[1]+Block2Last5[1]+Block3[2]+Block4[2] = 8 bytes.
+      if ((uint16_t)(pos + 8) > msgEnd) {
+        Serial.printf("UECP ODA Free-Format Group element truncated from %s\n", clientIp.c_str());
+        break;
+      }
+      uint8_t  groupByte   = destuffed[pos + 1];
+      uint8_t  configByte  = destuffed[pos + 2];
+      uint8_t  block2Last5 = destuffed[pos + 3];
+      uint16_t block3      = ((uint16_t)destuffed[pos + 4] << 8) | destuffed[pos + 5];
+      uint16_t block4      = ((uint16_t)destuffed[pos + 6] << 8) | destuffed[pos + 7];
+
+      uint8_t groupType  = groupByte >> 1;
+      bool    versionB   = (groupByte & 0x01) != 0;
+      uint8_t groupIndex = ffGroupIndex(groupType, versionB);
+
+      // Per spec, the lowest Group this MEC may ever target is Group 3B (ffGroupIndex(3,true) ==
+      // 7) - Group 3A and everything below it (0A/0B/1A/1B/2A/2B/3A) is out of scope: Group 3A
+      // already has its own dedicated ODA pathways (MEC 0x24/0x40/0x46), and there's no equivalent
+      // reason for any group below it to arrive this way either. Rejected outright rather than
+      // silently reinterpreted.
+      if (groupIndex < 7) {
+        Serial.printf("UECP MEC 0x42 (Group %u%c) from %s rejected: target must be Group 3B or "
+                      "higher\n", groupType, versionB ? 'B' : 'A', clientIp.c_str());
+        pos += 8;
+        continue;
+      }
+
+      // Config byte - same convention as MEC 0x46's own (bits7-6 reserved/unused, unchecked):
+      // bits5-4 priority (0=normal,1=urgent,2=immediate,3=unused); bits3-2 mode select (ignored
+      // for now, per spec, same as MEC 0x46 leaves them); bits1-0 buffer config (0b00/0b01 =
+      // one-shot - 0b01 is spec-undefined, treated as one-shot too, same "nearest safe bucket"
+      // precedent as MEC 0x24/0x30/0x40's own undefined codes; 0b10 = cyclic; 0b11 = clear).
+      uint8_t priority     = (configByte >> 4) & 0x03;
+      uint8_t bufferConfig = configByte & 0x03;
+      bool    immediate    = (priority == 0b10);
+      uint8_t flags        = (priority != 0) ? FF_FLAG_PRIORITY : 0;
+
+      // Priority (urgent/immediate) only meaningful paired with one-shot, per spec - same
+      // restriction MEC 0x46 enforces.
+      if (priority != 0 && bufferConfig != 0b00) {
+        Serial.printf("UECP MEC 0x42 (Group %u%c) from %s rejected: priority %u requires a "
+                      "one-shot buffer config (got %u)\n", groupType, versionB ? 'B' : 'A',
+                      clientIp.c_str(), priority, bufferConfig);
+        pos += 8;
+        continue;
+      }
+
+      if (bufferConfig == 0b11) {
+        ffClearGroup(ffPool, groupIndex);
+        Serial.printf("UECP applied MEC 0x42 (Group %u%c) buffer cleared from %s\n",
+                      groupType, versionB ? 'B' : 'A', clientIp.c_str());
+      } else if (!immediate && !rdsSequenceHasGroup(state, groupIndex)) {
+        Serial.printf("UECP MEC 0x42 (Group %u%c) from %s dropped: that group isn't in the "
+                      "current group sequence, so it would never be sent\n",
+                      groupType, versionB ? 'B' : 'A', clientIp.c_str());
+      } else {
+        bool cyclic = (bufferConfig == 0b10);
+        FfEnqueueResult result = ffEnqueue(ffPool, groupIndex, block2Last5, block3, block4, cyclic,
+                                           flags);
+        if (result != FF_ENQUEUE_FAILED) {
+          if (result == FF_ENQUEUE_OK_CLEARED) {
+            Serial.printf("UECP MEC 0x42 (Group %u%c): buffer was full - cleared it to make room "
+                          "for this message instead of dropping it; consider giving Group %u%c "
+                          "more airtime in the group sequence if this keeps happening\n",
+                          groupType, versionB ? 'B' : 'A', groupType, versionB ? 'B' : 'A');
+          }
+          Serial.printf("UECP applied MEC 0x42 (Group %u%c, %s) from %s\n",
+                        groupType, versionB ? 'B' : 'A', cyclic ? "cyclic" : "one-shot", clientIp.c_str());
+          if (immediate) pendingImmediateGroupIndex = groupIndex;
+        } else {
+          Serial.printf("UECP MEC 0x42 (Group %u%c) from %s dropped (free-format pool full)\n",
+                        groupType, versionB ? 'B' : 'A', clientIp.c_str());
+        }
       }
       pos += 8;
       continue;

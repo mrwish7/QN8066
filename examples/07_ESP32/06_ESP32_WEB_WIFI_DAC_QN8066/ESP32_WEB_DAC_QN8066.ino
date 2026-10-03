@@ -174,15 +174,17 @@ OdaLiveDirectory odaLiveDir;
 // nothing is pending.
 uint8_t pendingImmediateGroupIndex = FF_INDEX_NONE;
 
-// This device's own UECP address (site: 10 bits, encoder: 6 bits). 0/0 = accept every UECP frame
-// regardless of its address, per the UECP spec's "all sites"/"all encoders" convention. Set via
-// the web interface's UECP Site/Encoder Address fields.
-uint16_t uecpOurSite    = 0;
-uint8_t  uecpOurEncoder = 0;
+// This device's own UECP address(es) - see UecpAddressConfig's own comment in uecp_handler.h for
+// its default (a single 0/0 entry = accept every UECP frame regardless of its address) and how the
+// web interface's UECP Site/Encoder Address fields populate it. The UECP spec allows an encoder
+// more than one site address and more than one encoder address, up to
+// UECP_MAX_SITE_ADDRESSES/UECP_MAX_ENCODER_ADDRESSES (4/8) each - each field takes a comma-
+// separated hex list (e.g. "01A,02B"), replacing the whole respective list each time it's submitted.
+UecpAddressConfig uecpOurAddress;
 
 void audio_process_uecp(const uint8_t* data, size_t len) {
     processUecpFrame(data, (uint16_t)len, "AAC-DSE", uecpRdsState, ffPool, odaLiveDir,
-                     pendingImmediateGroupIndex, uecpOurSite, uecpOurEncoder);
+                     pendingImmediateGroupIndex, uecpOurAddress);
 }
 
 // Group scheduler state. The sequence position itself (rdsSeqPos) now lives in uecpRdsState
@@ -262,10 +264,22 @@ void handleStatus() {
   snprintf(piBuf, sizeof(piBuf), "%02X%02X", uecpRdsState.pi[0], uecpRdsState.pi[1]);
   char pinBuf[5];
   snprintf(pinBuf, sizeof(pinBuf), "%02X%02X", uecpRdsState.pin[0], uecpRdsState.pin[1]);
-  char uecpSiteBuf[4];
-  snprintf(uecpSiteBuf, sizeof(uecpSiteBuf), "%03X", uecpOurSite);
-  char uecpEncBuf[3];
-  snprintf(uecpEncBuf, sizeof(uecpEncBuf), "%02X", uecpOurEncoder);
+  // Comma-separated hex lists (e.g. "01A,02B") - the display counterpart of parseUecpAddressList()
+  // (uecp_handler.h), which the "uecp_site"/"uecp_enc" form fields parse back on submit.
+  char   uecpSiteBuf[UECP_MAX_SITE_ADDRESSES * 4 + 1] = "";
+  size_t uecpSitePos = 0;
+  for (uint8_t i = 0; i < uecpOurAddress.siteCount; i++) {
+    int written = snprintf(uecpSiteBuf + uecpSitePos, sizeof(uecpSiteBuf) - uecpSitePos,
+                           i == 0 ? "%03X" : ",%03X", uecpOurAddress.sites[i]);
+    if (written > 0) uecpSitePos += (size_t) written;
+  }
+  char   uecpEncBuf[UECP_MAX_ENCODER_ADDRESSES * 3 + 1] = "";
+  size_t uecpEncPos = 0;
+  for (uint8_t i = 0; i < uecpOurAddress.encoderCount; i++) {
+    int written = snprintf(uecpEncBuf + uecpEncPos, sizeof(uecpEncBuf) - uecpEncPos,
+                           i == 0 ? "%02X" : ",%02X", uecpOurAddress.encoders[i]);
+    if (written > 0) uecpEncPos += (size_t) written;
+  }
   char psUtf8[RDS_PS_LEN * 3 + 1];
   ebuToUtf8(uecpRdsState.ps, RDS_PS_LEN, psUtf8, sizeof(psUtf8));
   char rtUtf8[RDS_RT_MAX_LEN * 3 + 1];
@@ -390,15 +404,33 @@ void handleUpdate() {
     uecpRdsState.rt[0].repeatCount = (uint8_t) server.arg("rds_rt_repeat").toInt();
     Serial.printf("RDS RT repeat count updated to: %u\n", uecpRdsState.rt[0].repeatCount);
   } else if (strcmp(field, "uecp_site") == 0) {
-    char uecp_site[8];
+    // Comma-separated hex list (e.g. "01A,02B") - replaces the whole site address list wholesale,
+    // same "replace, don't append" convention as the "Group Sequence" field below; up to
+    // UECP_MAX_SITE_ADDRESSES (4) entries, extras silently dropped. A single "0" (the default)
+    // restores "accept every UECP frame regardless of its site address" - see UecpAddressConfig's
+    // own comment in uecp_handler.h and uecpAddressMatches() in uecp_handler.cpp for the exact rule
+    // once more than one address is configured.
+    char uecp_site[24];
     server.arg("uecp_site").toCharArray(uecp_site, sizeof(uecp_site));
-    uecpOurSite = (uint16_t) strtol(uecp_site, NULL, 16) & 0x03FF;
-    Serial.printf("UECP Site Address updated to: 0x%X\n", uecpOurSite);
+    uint16_t parsed[UECP_MAX_SITE_ADDRESSES];
+    uint8_t  n = parseUecpAddressList(uecp_site, parsed, UECP_MAX_SITE_ADDRESSES, 0x03FF, 16);
+    if (n > 0) {
+      memcpy(uecpOurAddress.sites, parsed, n * sizeof(uint16_t));
+      uecpOurAddress.siteCount = n;
+    }
+    Serial.printf("UECP Site Address(es) updated to: %s (%u entries)\n", uecp_site, n);
   } else if (strcmp(field, "uecp_enc") == 0) {
-    char uecp_enc[8];
+    // Comma-separated hex list (e.g. "00,01") - same "replace wholesale" convention as uecp_site
+    // above; up to UECP_MAX_ENCODER_ADDRESSES (8) entries.
+    char uecp_enc[32];
     server.arg("uecp_enc").toCharArray(uecp_enc, sizeof(uecp_enc));
-    uecpOurEncoder = (uint8_t) strtol(uecp_enc, NULL, 16) & 0x3F;
-    Serial.printf("UECP Encoder Address updated to: 0x%X\n", uecpOurEncoder);
+    uint16_t parsed[UECP_MAX_ENCODER_ADDRESSES];
+    uint8_t  n = parseUecpAddressList(uecp_enc, parsed, UECP_MAX_ENCODER_ADDRESSES, 0x3F, 16);
+    if (n > 0) {
+      for (uint8_t i = 0; i < n; i++) uecpOurAddress.encoders[i] = (uint8_t) parsed[i];
+      uecpOurAddress.encoderCount = n;
+    }
+    Serial.printf("UECP Encoder Address(es) updated to: %s (%u entries)\n", uecp_enc, n);
   } else if (strcmp(field, "oda_add") == 0) {
     // Manually configure one ODA AID -> group mapping (see rds_state.h's odaManual[] and
     // buildGroup3A()), and seed the same mapping into the live directory (oda_directory.h) so
@@ -590,9 +622,9 @@ void handleFormSubmit() {
   server.arg("rds_dsn").toCharArray(rds_dsn, sizeof(rds_dsn));
   char rds_psn[8];
   server.arg("rds_psn").toCharArray(rds_psn, sizeof(rds_psn));
-  char uecp_site[8];
+  char uecp_site[24]; // comma-separated hex list, up to UECP_MAX_SITE_ADDRESSES entries
   server.arg("uecp_site").toCharArray(uecp_site, sizeof(uecp_site));
-  char uecp_enc[8];
+  char uecp_enc[32]; // comma-separated hex list, up to UECP_MAX_ENCODER_ADDRESSES entries
   server.arg("uecp_enc").toCharArray(uecp_enc, sizeof(uecp_enc));
   char rds_pin[8];
   server.arg("rds_pin").toCharArray(rds_pin, sizeof(rds_pin));
@@ -696,8 +728,22 @@ void handleFormSubmit() {
 
   if (rds_dsn[0]   != '\0') uecpRdsState.dsn = (uint8_t) atoi(rds_dsn);
   if (rds_psn[0]   != '\0') uecpRdsState.psn = (uint8_t) atoi(rds_psn);
-  if (uecp_site[0] != '\0') uecpOurSite    = (uint16_t) strtol(uecp_site, NULL, 16) & 0x03FF;
-  if (uecp_enc[0]  != '\0') uecpOurEncoder = (uint8_t)  strtol(uecp_enc, NULL, 16) & 0x3F;
+  if (uecp_site[0] != '\0') {
+    uint16_t parsed[UECP_MAX_SITE_ADDRESSES];
+    uint8_t  n = parseUecpAddressList(uecp_site, parsed, UECP_MAX_SITE_ADDRESSES, 0x03FF, 16);
+    if (n > 0) {
+      memcpy(uecpOurAddress.sites, parsed, n * sizeof(uint16_t));
+      uecpOurAddress.siteCount = n;
+    }
+  }
+  if (uecp_enc[0] != '\0') {
+    uint16_t parsed[UECP_MAX_ENCODER_ADDRESSES];
+    uint8_t  n = parseUecpAddressList(uecp_enc, parsed, UECP_MAX_ENCODER_ADDRESSES, 0x3F, 16);
+    if (n > 0) {
+      for (uint8_t i = 0; i < n; i++) uecpOurAddress.encoders[i] = (uint8_t) parsed[i];
+      uecpOurAddress.encoderCount = n;
+    }
+  }
   if (rds_pin[0]   != '\0') {
     uint16_t pin = (uint16_t) strtol(rds_pin, NULL, 16);
     uecpRdsState.pin[0] = (uint8_t)(pin >> 8);
@@ -795,7 +841,7 @@ void handleUecpServer() {
         uecp_clients[i].inPacket = false;
         processUecpFrame(uecp_clients[i].buf, uecp_clients[i].bufLen,
                          c.remoteIP().toString(), uecpRdsState, ffPool, odaLiveDir,
-                         pendingImmediateGroupIndex, uecpOurSite, uecpOurEncoder);
+                         pendingImmediateGroupIndex, uecpOurAddress);
         uecp_clients[i].bufLen = 0;
       } else if (uecp_clients[i].inPacket) {
         if (uecp_clients[i].bufLen < UECP_MAX_FRAME) {

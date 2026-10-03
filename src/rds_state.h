@@ -81,33 +81,27 @@ struct RdsTxState {
   uint8_t slcCurrent;
 
   RtMessage rt[RDS_RT_BUFFER_SIZE];
-  uint8_t   rtCount;        // number of populated messages (1-6)
+  uint8_t   rtCount;        // number of populated messages (0-6); 0 = no RT configured at all (the
+                             // boot default - see rds_defaults.cpp) or explicitly cleared with no
+                             // replacement text (MEC 0x0A with MEL==0, or MEL==1 and clear-bits with
+                             // no text byte - see uecpApplyRt() in uecp_handler.cpp), in which case
+                             // rds_scheduler.cpp's buildNextGroup() stops building Group 2A entirely
+                             // until real RT text arrives, the same way it skips any other group
+                             // with nothing to send rather than transmitting empty content
   uint8_t   rtCurrent;      // index of message currently being transmitted
   uint8_t   rtSegment;      // 0-15: which 4-byte chunk within current message
   uint8_t   rtRepeatsDone;  // full passes of current message completed this cycle
   bool      rtABFlag;       // live A/B flag value used in every Group 2A group
-  bool      rtSeeded;       // true once real (UECP/web) content has ever replaced the boot
-                             // placeholder RT text - the placeholder was never part of a genuine
-                             // broadcast toggle lineage, so the first real update adopts its own
-                             // toggleAB bit directly instead of flipping relative to it
-
-  // "Buffer RT" mode: false (default) is this project's original behaviour - a new RT replace
-  // (MEC 0x0A / CFG "RT=" / the WiFi sketches' own "rds_rt" web field, all of which arrive with the
-  // buffer-config bits set to "clear") is applied to rt[]/rtCount immediately, in the same call,
-  // even if a message is only part-way through transmitting - matching the RDS spec's own
-  // expectation that the text A/B flag alone is enough for a receiver to notice "content changed"
-  // mid-cycle. Set true to defer that replace instead: the incoming content is staged into
-  // rtPending[]/rtPendingCount/rtPendingValid (mirroring psPending/psPendingValid's own staging for
-  // PS) and only swapped into rt[]/rtCount once the message currently transmitting has shown one
-  // full pass through its own text - see rds_scheduler.cpp's buildGroup2A(), which performs the
-  // actual swap the moment rtSegment wraps back to 0. Only affects a clearing replace; an append
-  // (buffer-config bits set to anything else) never disturbs what's currently playing in the first
-  // place, so there's nothing for this mode to protect there either way - it always applies
-  // straight to rt[]/rtCount regardless of rtBufferMode.
-  bool      rtBufferMode;
-  RtMessage rtPending[RDS_RT_BUFFER_SIZE];
-  uint8_t   rtPendingCount;
-  bool      rtPendingValid;
+  bool      rtSeeded;       // true once real (UECP/web) content has been stored in rt[] since the
+                             // last time RT was paused (boot, or a clear-with-no-text that leaves
+                             // rtCount at 0 - see uecpApplyRt(), which resets this back to false
+                             // the moment RT goes empty). While
+                             // false, there's nothing meaningful yet to flip relative to, so the
+                             // first real message after the pause forces rtABFlag to false (the A
+                             // position) outright, regardless of its own toggleAB bit, instead of
+                             // flipping it against a value that was never part of a genuine
+                             // broadcast toggle lineage - every following message's toggleAB bit is
+                             // then respected normally until the next pause
 
   uint8_t af[RDS_AF_MAX_LEN]; // raw AF list bytes as received (Method A/B per UECP MEC 0x13, unparsed)
   uint8_t afLen;              // actual used length within af[] (0 = no AF list yet)

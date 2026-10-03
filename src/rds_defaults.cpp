@@ -31,12 +31,11 @@ void rdsTxStateSetDefaults(RdsTxState& state) {
                          // gets sent (carrying PIN) even before any real SLC has been configured
   state.slcCurrent = 0;
 
-  RtMessage& msg = state.rt[0];
-  msg.textLen     = (uint8_t)utf8ToEbu("QN8066 RDS Transmitter", msg.text, RDS_RT_MAX_LEN);
-  msg.repeatCount = 0; // loop forever
-  msg.toggleAB    = false;
-  state.rtCount       = 1;
-  state.rtCurrent     = 0;
+  // No boot default RT content - rtCount stays 0 (from the memset above), so
+  // rds_scheduler.cpp's buildNextGroup() won't build Group 2A at all until real RT text actually
+  // arrives (MEC 0x0A, a CFG "RT=" line, or a web "rds_rt" field - see rtCount's own comment in
+  // rds_state.h). A sketch that wants a non-empty boot RT message can still set one right after
+  // this call, in its own setup() - same pattern as state.pi[] above.
   state.rtSegment     = 0;
   state.rtRepeatsDone = 0;
   state.rtABFlag      = false;
