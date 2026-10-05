@@ -70,9 +70,11 @@ inline uint8_t parseUecpAddressList(const char* text, uint16_t* out, uint8_t max
 // rawInner: the bytes captured between 0xFE and 0xFF (not including those framing bytes).
 // rawLen:   number of bytes in rawInner.
 // clientIp: used only for log messages.
-// state:    RDS transmitter state updated by each handled MEC.
+// state:    RDS encoder state (all data sets) updated by each handled MEC - see
+//           uecp_handler.cpp's uecpDsnTargets()/uecpForEachMainService() for how DSN/PSN pick
+//           which data set(s)/service(s) an element lands in.
 // ffPool:   free-format (MEC 0x24/0x30) per-group queues updated by those MECs - see
-//           free_format_groups.h. Unrelated to state/RdsTxState, which only ever holds this
+//           free_format_groups.h. Unrelated to state/RdsEncoderState, which only ever holds this
 //           project's own fixed struct-backed groups (0A/1A/2A/3A-manual/4A).
 // odaLiveDir: persistent AID -> group directory, updated whenever a live Group 3A MEC 0x24/0x40/
 //           0x46 definition arrives - see oda_directory.h. Independent of ffPool's own Group 3A
@@ -85,6 +87,6 @@ inline uint8_t parseUecpAddressList(const char* text, uint16_t* out, uint8_t max
 //           its default and how each sketch populates it; see processUecpFrame()'s address-filter
 //           step (uecpAddressMatches() in uecp_handler.cpp) for the exact matching rule.
 void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
-                      const String& clientIp, RdsTxState& state, FreeFormatPool& ffPool,
+                      const String& clientIp, RdsEncoderState& state, FreeFormatPool& ffPool,
                       OdaLiveDirectory& odaLiveDir, uint8_t& pendingImmediateGroupIndex,
                       const UecpAddressConfig& ourAddress);

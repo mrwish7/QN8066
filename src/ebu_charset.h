@@ -7,7 +7,7 @@
 // Bytes 0x80-0xFF map to the extended Latin/Greek/symbol table in ebu_charset.cpp.
 
 // Converts a NUL-terminated UTF-8 string to EBU bytes. Writes at most outMax bytes into out
-// (not NUL-terminated - out is a fixed-width byte buffer, e.g. RdsTxState::ps or RtMessage::text).
+// (not NUL-terminated - out is a fixed-width byte buffer, e.g. RdsMainService::ps or RtMessage::text).
 // Unrepresentable code points map to '?' (0x3F). Returns the number of bytes written.
 size_t utf8ToEbu(const char* utf8, uint8_t* out, size_t outMax);
 

@@ -103,6 +103,31 @@ const char* ssid = "ssid";
 // Change to your WIFI SSID
 const char* password = "password";
 // Change to your password
+const char* hostname = "qn8066";
+// Network (DHCP/DNS) hostname this device registers as
+
+// --- Boot-time RDS station-identity defaults - edit these and re-flash to set a station's identity
+// the moment the board boots, with no web form or UECP frame needed first. Applied in setup(),
+// right after rdsEncoderStateSetDefaults(uecpRdsState), overriding the generic placeholder values
+// that shared library call sets (rds_defaults.cpp), to every data set's main service alike (DSN
+// 1-6, PSN 1). Still fully reconfigurable afterwards at runtime: the web form's RDS fields, or a
+// UECP frame (MEC 0x01=PI, 0x02=PS, 0x0A=RT, 0x07=PTY, 0x03=TA/TP, 0x04=DI, 0x05=MS) - but a
+// reset or power cycle always comes back to these.
+uint16_t rdsDefaultPI    = 0xCC66;     // placeholder - set your station's real assigned PI code here
+const char* rdsDefaultPS = "*QN8066*"; // up to 8 chars; shorter values are space-padded
+const char* rdsDefaultRT = "";         // up to 64 chars; "" means no boot RT message at all -
+                                         // rds_scheduler.cpp's buildNextGroup() then won't build
+                                         // Group 2A until a real one arrives
+uint8_t  rdsDefaultPTY   = 0;          // Programme Type code (0 = undefined/none)
+bool     rdsDefaultTA    = false;      // Traffic Announcement
+bool     rdsDefaultTP    = true;       // Traffic Programme
+bool     rdsDefaultMusic = true;       // Music/Speech: true = Music, false = Speech
+bool     rdsDefaultStereo         = true;  // RDS DI Mono/Stereo flag - independent of
+                                             // currentStereoMono above, which is the chip's own
+                                             // actual audio encoding, not this RDS-advertised flag
+bool     rdsDefaultArtificialHead = false; // RDS DI Artificial Head flag
+bool     rdsDefaultCompressed     = false; // RDS DI Compressed flag
+bool     rdsDefaultDynamicPTY     = false; // RDS DI Dynamic PTY flag
 
 // Local Time setup
 const long gmtOffset_sec = 7200;
@@ -147,7 +172,7 @@ bool rawGroupMode = false;
 
 // RDS state fed by UECP frames from the TCP server below and by the web interface. This is the
 // single source of truth for everything buildNextGroup() transmits.
-RdsTxState uecpRdsState;
+RdsEncoderState uecpRdsState;
 
 // Persistent ODA AID -> group directory, learned from live Group 3A traffic - see
 // oda_directory.h and uecp_handler.cpp's isGroup3A handling. Outlives ffPool's own Group 3A
@@ -182,8 +207,8 @@ time_t lastCtMinuteSent = -1;
 // epoch-minute index (unix time / 60) of the last Clock Time group actually sent; -1 = never -
 // latches so buildNextGroup()'s per-call :00 check can't fire twice for the same minute
 
-// Boot-time default group sequence, copied into uecpRdsState.rdsSequence[]/rdsSequenceLen once in
-// setup() (see rdsTxStateSetDefaults()'s call site below). Editing these two constants and
+// Boot-time default group sequence, copied into every data set's rdsSequence[]/rdsSequenceLen once
+// in setup() (see rdsEncoderStateSetDefaults()'s call site below). Editing these two constants and
 // re-flashing changes only the *default* - the live, actually-scheduled copy in uecpRdsState is
 // what buildNextGroup() reads, and is independently reconfigurable at runtime (UECP MEC 0x16, or
 // the web form's "Group Sequence" field) without touching either of these.
@@ -244,10 +269,11 @@ static void bufAppend(char* buf, size_t bufSize, size_t* pos, const char* fmt, .
 }
 
 void handleStatus() {
+  const RdsMainService& main = rdsActiveMain(uecpRdsState);
   char piBuf[5];
-  snprintf(piBuf, sizeof(piBuf), "%02X%02X", uecpRdsState.pi[0], uecpRdsState.pi[1]);
+  snprintf(piBuf, sizeof(piBuf), "%02X%02X", main.pi[0], main.pi[1]);
   char pinBuf[5];
-  snprintf(pinBuf, sizeof(pinBuf), "%02X%02X", uecpRdsState.pin[0], uecpRdsState.pin[1]);
+  snprintf(pinBuf, sizeof(pinBuf), "%02X%02X", main.pin[0], main.pin[1]);
   // Comma-separated hex lists (e.g. "01A,02B") - the display counterpart of parseUecpAddressList()
   // (uecp_handler.h), which the "uecp_site"/"uecp_enc" form fields parse back on submit.
   char   uecpSiteBuf[UECP_MAX_SITE_ADDRESSES * 4 + 1] = "";
@@ -265,9 +291,9 @@ void handleStatus() {
     if (written > 0) uecpEncPos += (size_t) written;
   }
   char psUtf8[RDS_PS_LEN * 3 + 1];
-  ebuToUtf8(uecpRdsState.ps, RDS_PS_LEN, psUtf8, sizeof(psUtf8));
+  ebuToUtf8(main.ps, RDS_PS_LEN, psUtf8, sizeof(psUtf8));
   char rtUtf8[RDS_RT_MAX_LEN * 3 + 1];
-  ebuToUtf8(uecpRdsState.rt[0].text, uecpRdsState.rt[0].textLen, rtUtf8, sizeof(rtUtf8));
+  ebuToUtf8(main.rt[0].text, main.rt[0].textLen, rtUtf8, sizeof(rtUtf8));
 
   char psEscaped[sizeof(psUtf8) * 2];
   jsonEscape(psUtf8, psEscaped, sizeof(psEscaped));
@@ -286,27 +312,30 @@ void handleStatus() {
   bufAppend(json, sizeof(json), &pos, ",\"soft_clip\":%u", currentSoftClip);
   bufAppend(json, sizeof(json), &pos, ",\"raw_mode\":%u", rawGroupMode ? 1 : 0);
   bufAppend(json, sizeof(json), &pos, ",\"rds_pi\":\"%s\"", piBuf);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_pty\":%u", uecpRdsState.pty);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_pty\":%u", main.pty);
   bufAppend(json, sizeof(json), &pos, ",\"rds_ps\":\"%s\"", psEscaped);
   bufAppend(json, sizeof(json), &pos, ",\"rds_rt\":\"%s\"", rtEscaped);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_dsn\":%u", uecpRdsState.dsn);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_psn\":%u", uecpRdsState.psn);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_dsn\":%u", uecpRdsState.activeDsn);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_psn\":%u", main.psnNumber);
   bufAppend(json, sizeof(json), &pos, ",\"uecp_site\":\"%s\"", uecpSiteBuf);
   bufAppend(json, sizeof(json), &pos, ",\"uecp_enc\":\"%s\"", uecpEncBuf);
   bufAppend(json, sizeof(json), &pos, ",\"rds_pin\":\"%s\"", pinBuf);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_ta\":%u", (uecpRdsState.tatp & 0x01) ? 1 : 0);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_tp\":%u", (uecpRdsState.tatp & 0x02) ? 1 : 0);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_ms\":%u", (uecpRdsState.ms & 0x01) ? 1 : 0);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_di_stereo\":%u", (uecpRdsState.diPtyi & 0x01) ? 1 : 0);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_di_artifhead\":%u", (uecpRdsState.diPtyi & 0x02) ? 1 : 0);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_di_compressed\":%u", (uecpRdsState.diPtyi & 0x04) ? 1 : 0);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_ptyi\":%u", (uecpRdsState.diPtyi & 0x08) ? 1 : 0);
-  bufAppend(json, sizeof(json), &pos, ",\"rds_rt_repeat\":%u", uecpRdsState.rt[0].repeatCount);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_ta\":%u", (main.tatp & 0x01) ? 1 : 0);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_tp\":%u", (main.tatp & 0x02) ? 1 : 0);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_ms\":%u", (main.ms & 0x01) ? 1 : 0);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_di_stereo\":%u", (main.diPtyi & 0x01) ? 1 : 0);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_di_artifhead\":%u", (main.diPtyi & 0x02) ? 1 : 0);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_di_compressed\":%u", (main.diPtyi & 0x04) ? 1 : 0);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_ptyi\":%u", (main.diPtyi & 0x08) ? 1 : 0);
+  bufAppend(json, sizeof(json), &pos, ",\"rds_rt_repeat\":%u", main.rt[0].repeatCount);
   bufAppend(json, sizeof(json), &pos, "}");
   server.send(200, "application/json", json);
 }
 
 void handleUpdate() {
+  // Every RDS field below edits the active data set (the one on air) - see "rds_dsn".
+  RdsDataSet&     ds   = rdsActiveDataSet(uecpRdsState);
+  RdsMainService& main = ds.main;
   char field[24];
   server.argName(0).toCharArray(field, sizeof(field));
   // Processa e aplica o valor do campo correspondente
@@ -336,12 +365,12 @@ void handleUpdate() {
     char rds_pi[8];
     server.arg("rds_pi").toCharArray(rds_pi, sizeof(rds_pi));
     uint16_t pi = (uint16_t) strtol(rds_pi, NULL, 16);
-    uecpRdsState.pi[0] = (uint8_t)(pi >> 8);
-    uecpRdsState.pi[1] = (uint8_t)(pi & 0xFF);
+    main.pi[0] = (uint8_t)(pi >> 8);
+    main.pi[1] = (uint8_t)(pi & 0xFF);
     Serial.printf("RDS PI updated to: 0x%04X\n", pi);
   } else if (strcmp(field, "rds_pty") == 0) {
-    uecpRdsState.pty = (uint8_t) server.arg("rds_pty").toInt();
-    Serial.printf("RDS PTY updated to: %u\n", uecpRdsState.pty);
+    main.pty = (uint8_t) server.arg("rds_pty").toInt();
+    Serial.printf("RDS PTY updated to: %u\n", main.pty);
   } else if (strcmp(field, "rds_ps") == 0) {
     char rds_ps[40];
     server.arg("rds_ps").toCharArray(rds_ps, sizeof(rds_ps));
@@ -350,8 +379,8 @@ void handleUpdate() {
     rds_ps[len] = '\0';
     // Staged, not applied to ps[] directly - see buildNextGroup()'s psSegment==0 wrap check, same
     // clean-swap guarantee as a UECP MEC 0x02 update.
-    utf8ToEbu(rds_ps, uecpRdsState.psPending, RDS_PS_LEN);
-    uecpRdsState.psPendingValid = true;
+    utf8ToEbu(rds_ps, main.psPending, RDS_PS_LEN);
+    main.psPendingValid = true;
     Serial.printf("RDS PS updated to: %s\n", rds_ps);
   } else if (strcmp(field, "rds_rt") == 0) {
     // Small headroom over RDS_RT_MAX_LEN for a stray/oversized submission - toCharArray() below
@@ -360,19 +389,19 @@ void handleUpdate() {
     server.arg("rds_rt").toCharArray(rds_rt, sizeof(rds_rt));
     // The web interface only ever controls a single RT message: submitting new text clears the
     // whole buffer (any other slots are UECP-only territory) and becomes the sole message 0.
-    memset(uecpRdsState.rt, 0, sizeof(uecpRdsState.rt));
-    uecpRdsState.rt[0].textLen     = (uint8_t) utf8ToEbu(rds_rt, uecpRdsState.rt[0].text, RDS_RT_MAX_LEN);
-    uecpRdsState.rt[0].repeatCount = 0;  // infinite
-    uecpRdsState.rt[0].toggleAB    = true;
-    uecpRdsState.rtCount           = 1;
+    memset(main.rt, 0, sizeof(main.rt));
+    main.rt[0].textLen     = (uint8_t) utf8ToEbu(rds_rt, main.rt[0].text, RDS_RT_MAX_LEN);
+    main.rt[0].repeatCount = 0;  // infinite
+    main.rt[0].toggleAB    = true;
+    main.rtCount           = 1;
     uecpRdsState.rtCurrent         = 0;
     uecpRdsState.rtSegment         = 0;
     uecpRdsState.rtRepeatsDone     = 0;
-    uecpRdsState.rtABFlag          = !uecpRdsState.rtABFlag;
+    main.rtABFlag          = !main.rtABFlag;
     Serial.printf("RDS RT updated to: %s\n", rds_rt);
   } else if (strcmp(field, "rds_rt_repeat") == 0) {
-    uecpRdsState.rt[0].repeatCount = (uint8_t) server.arg("rds_rt_repeat").toInt();
-    Serial.printf("RDS RT repeat count updated to: %u\n", uecpRdsState.rt[0].repeatCount);
+    main.rt[0].repeatCount = (uint8_t) server.arg("rds_rt_repeat").toInt();
+    Serial.printf("RDS RT repeat count updated to: %u\n", main.rt[0].repeatCount);
   } else if (strcmp(field, "uecp_site") == 0) {
     // Comma-separated hex list (e.g. "01A,02B") - replaces the whole site address list wholesale,
     // same "replace, don't append" convention as the "Group Sequence" field below; up to
@@ -461,57 +490,69 @@ void handleUpdate() {
       for (const char* q = p; *q; q++) {
         if (*q == 'B' || *q == 'b') { versionB = true; break; }
       }
-      uecpRdsState.rdsSequence[newLen++] = ffGroupIndex(groupType, versionB);
+      ds.rdsSequence[newLen++] = ffGroupIndex(groupType, versionB);
       if (comma == nullptr) break;
       p = comma + 1;
     }
     if (newLen == 0) {
       Serial.println("RDS group sequence value had no valid entries, ignored");
     } else {
-      uecpRdsState.rdsSequenceLen = newLen;
+      ds.rdsSequenceLen = newLen;
       uecpRdsState.rdsSeqPos      = 0; // restart from the new sequence's own beginning
       Serial.printf("RDS group sequence updated (%u entries)\n", newLen);
     }
   } else if (strcmp(field, "rds_dsn") == 0) {
-    uecpRdsState.dsn = (uint8_t) server.arg("rds_dsn").toInt();
-    Serial.printf("RDS DSN updated to: %u\n", uecpRdsState.dsn);
+    // Switches the active data set (1-6) - the same thing UECP MEC 0x1C will do.
+    uint8_t dsn = (uint8_t) server.arg("rds_dsn").toInt();
+    if (rdsSelectDataSet(uecpRdsState, dsn)) {
+      Serial.printf("RDS active DSN switched to: %u\n", dsn);
+    } else {
+      Serial.printf("RDS DSN %u out of range (1-%u), ignored\n", dsn, RDS_DSN_COUNT);
+    }
   } else if (strcmp(field, "rds_psn") == 0) {
-    uecpRdsState.psn = (uint8_t) server.arg("rds_psn").toInt();
-    Serial.printf("RDS PSN updated to: %u\n", uecpRdsState.psn);
+    // Renumbers the active data set's main service (1-255) - the PSN UECP elements must address it
+    // by (PSN 0 always reaches it regardless).
+    uint8_t psn = (uint8_t) server.arg("rds_psn").toInt();
+    if (psn != 0) {
+      main.psnNumber = psn;
+      Serial.printf("RDS main service PSN updated to: %u\n", psn);
+    } else {
+      Serial.println("RDS PSN 0 isn't a valid service number (1-255), ignored");
+    }
   } else if (strcmp(field, "rds_pin") == 0) {
     char rds_pin[8];
     server.arg("rds_pin").toCharArray(rds_pin, sizeof(rds_pin));
     uint16_t pin = (uint16_t) strtol(rds_pin, NULL, 16);
-    uecpRdsState.pin[0] = (uint8_t)(pin >> 8);
-    uecpRdsState.pin[1] = (uint8_t)(pin & 0xFF);
+    main.pin[0] = (uint8_t)(pin >> 8);
+    main.pin[1] = (uint8_t)(pin & 0xFF);
     Serial.printf("RDS PIN updated to: 0x%04X\n", pin);
   } else if (strcmp(field, "rds_ta") == 0) {
     bool on = (server.arg("rds_ta") == "1");
-    uecpRdsState.tatp = on ? (uecpRdsState.tatp | 0x01) : (uecpRdsState.tatp & (uint8_t)~0x01);
+    main.tatp = on ? (main.tatp | 0x01) : (main.tatp & (uint8_t)~0x01);
     Serial.printf("RDS TA updated to: %s\n", on ? "1" : "0");
   } else if (strcmp(field, "rds_tp") == 0) {
     bool on = (server.arg("rds_tp") == "1");
-    uecpRdsState.tatp = on ? (uecpRdsState.tatp | 0x02) : (uecpRdsState.tatp & (uint8_t)~0x02);
+    main.tatp = on ? (main.tatp | 0x02) : (main.tatp & (uint8_t)~0x02);
     Serial.printf("RDS TP updated to: %s\n", on ? "1" : "0");
   } else if (strcmp(field, "rds_ms") == 0) {
     bool on = (server.arg("rds_ms") == "1");
-    uecpRdsState.ms = on ? (uecpRdsState.ms | 0x01) : (uecpRdsState.ms & (uint8_t)~0x01);
+    main.ms = on ? (main.ms | 0x01) : (main.ms & (uint8_t)~0x01);
     Serial.printf("RDS MS updated to: %s\n", on ? "1" : "0");
   } else if (strcmp(field, "rds_di_stereo") == 0) {
     bool on = (server.arg("rds_di_stereo") == "1");
-    uecpRdsState.diPtyi = on ? (uecpRdsState.diPtyi | 0x01) : (uecpRdsState.diPtyi & (uint8_t)~0x01);
+    main.diPtyi = on ? (main.diPtyi | 0x01) : (main.diPtyi & (uint8_t)~0x01);
     Serial.printf("RDS DI Mono/Stereo updated to: %s\n", on ? "1" : "0");
   } else if (strcmp(field, "rds_di_artifhead") == 0) {
     bool on = (server.arg("rds_di_artifhead") == "1");
-    uecpRdsState.diPtyi = on ? (uecpRdsState.diPtyi | 0x02) : (uecpRdsState.diPtyi & (uint8_t)~0x02);
+    main.diPtyi = on ? (main.diPtyi | 0x02) : (main.diPtyi & (uint8_t)~0x02);
     Serial.printf("RDS DI Artificial Head updated to: %s\n", on ? "1" : "0");
   } else if (strcmp(field, "rds_di_compressed") == 0) {
     bool on = (server.arg("rds_di_compressed") == "1");
-    uecpRdsState.diPtyi = on ? (uecpRdsState.diPtyi | 0x04) : (uecpRdsState.diPtyi & (uint8_t)~0x04);
+    main.diPtyi = on ? (main.diPtyi | 0x04) : (main.diPtyi & (uint8_t)~0x04);
     Serial.printf("RDS DI Compressed updated to: %s\n", on ? "1" : "0");
   } else if (strcmp(field, "rds_ptyi") == 0) {
     bool on = (server.arg("rds_ptyi") == "1");
-    uecpRdsState.diPtyi = on ? (uecpRdsState.diPtyi | 0x08) : (uecpRdsState.diPtyi & (uint8_t)~0x08);
+    main.diPtyi = on ? (main.diPtyi | 0x08) : (main.diPtyi & (uint8_t)~0x08);
     Serial.printf("RDS Dynamic PTY updated to: %s\n", on ? "1" : "0");
   } else if (strcmp(field, "frequency_deviation") == 0) {
     currentFreqDeviation = server.arg("frequency_deviation").toInt();
@@ -568,6 +609,9 @@ void handleUpdate() {
 
 // Função para tratar o envio do formulário
 void handleFormSubmit() {
+  // The submitted RDS values are saved to the data set active when the form was submitted; a changed
+  // DSN is applied last (see below), switching to that data set afterwards.
+  RdsMainService& main = rdsActiveMain(uecpRdsState);
   char frequency[16];
   server.arg("frequency").toCharArray(frequency, sizeof(frequency));
   char power[8];
@@ -653,33 +697,32 @@ void handleFormSubmit() {
     size_t len = strlen(rds_ps);
     while (len < 8 && len + 1 < sizeof(rds_ps)) rds_ps[len++] = ' ';
     rds_ps[len] = '\0';
-    utf8ToEbu(rds_ps, uecpRdsState.psPending, RDS_PS_LEN);
-    uecpRdsState.psPendingValid = true;
+    utf8ToEbu(rds_ps, main.psPending, RDS_PS_LEN);
+    main.psPendingValid = true;
   }
   if (rds_rt[0] != '\0') {
     // See handleUpdate()'s "rds_rt" branch: the web interface only ever controls a single RT
     // message, so a new submission clears the whole buffer and becomes the sole message 0.
-    memset(uecpRdsState.rt, 0, sizeof(uecpRdsState.rt));
-    uecpRdsState.rt[0].textLen     = (uint8_t) utf8ToEbu(rds_rt, uecpRdsState.rt[0].text, RDS_RT_MAX_LEN);
-    uecpRdsState.rt[0].repeatCount = 0;  // infinite
-    uecpRdsState.rt[0].toggleAB    = true;
-    uecpRdsState.rtCount           = 1;
+    memset(main.rt, 0, sizeof(main.rt));
+    main.rt[0].textLen     = (uint8_t) utf8ToEbu(rds_rt, main.rt[0].text, RDS_RT_MAX_LEN);
+    main.rt[0].repeatCount = 0;  // infinite
+    main.rt[0].toggleAB    = true;
+    main.rtCount           = 1;
     uecpRdsState.rtCurrent         = 0;
     uecpRdsState.rtSegment         = 0;
     uecpRdsState.rtRepeatsDone     = 0;
-    uecpRdsState.rtABFlag          = !uecpRdsState.rtABFlag;
+    main.rtABFlag          = !main.rtABFlag;
   }
-  if (rds_rt_repeat[0] != '\0') uecpRdsState.rt[0].repeatCount = (uint8_t) atoi(rds_rt_repeat);
+  if (rds_rt_repeat[0] != '\0') main.rt[0].repeatCount = (uint8_t) atoi(rds_rt_repeat);
 
   if (rds_pi[0] != '\0') {
     uint16_t pi = (uint16_t) strtol(rds_pi, NULL, 16);
-    uecpRdsState.pi[0] = (uint8_t)(pi >> 8);
-    uecpRdsState.pi[1] = (uint8_t)(pi & 0xFF);
+    main.pi[0] = (uint8_t)(pi >> 8);
+    main.pi[1] = (uint8_t)(pi & 0xFF);
   }
-  uecpRdsState.pty = (uint8_t) atoi(rds_pty);
+  main.pty = (uint8_t) atoi(rds_pty);
 
-  if (rds_dsn[0]   != '\0') uecpRdsState.dsn = (uint8_t) atoi(rds_dsn);
-  if (rds_psn[0]   != '\0') uecpRdsState.psn = (uint8_t) atoi(rds_psn);
+  if (rds_psn[0]   != '\0' && atoi(rds_psn) != 0) main.psnNumber = (uint8_t) atoi(rds_psn);
   if (uecp_site[0] != '\0') {
     uint16_t parsed[UECP_MAX_SITE_ADDRESSES];
     uint8_t  n = parseUecpAddressList(uecp_site, parsed, UECP_MAX_SITE_ADDRESSES, 0x03FF, 16);
@@ -698,19 +741,19 @@ void handleFormSubmit() {
   }
   if (rds_pin[0]   != '\0') {
     uint16_t pin = (uint16_t) strtol(rds_pin, NULL, 16);
-    uecpRdsState.pin[0] = (uint8_t)(pin >> 8);
-    uecpRdsState.pin[1] = (uint8_t)(pin & 0xFF);
+    main.pin[0] = (uint8_t)(pin >> 8);
+    main.pin[1] = (uint8_t)(pin & 0xFF);
   }
 
   // The flag selects are always present in a full-form submit (unlike native checkboxes,
   // which browsers omit from FormData when unchecked), so these are applied unconditionally.
-  uecpRdsState.tatp = (strcmp(rds_ta, "1") == 0) ? (uecpRdsState.tatp | 0x01) : (uecpRdsState.tatp & (uint8_t)~0x01);
-  uecpRdsState.tatp = (strcmp(rds_tp, "1") == 0) ? (uecpRdsState.tatp | 0x02) : (uecpRdsState.tatp & (uint8_t)~0x02);
-  uecpRdsState.ms   = (strcmp(rds_ms, "1") == 0) ? (uecpRdsState.ms   | 0x01) : (uecpRdsState.ms   & (uint8_t)~0x01);
-  uecpRdsState.diPtyi = (strcmp(rds_di_stereo,     "1") == 0) ? (uecpRdsState.diPtyi | 0x01) : (uecpRdsState.diPtyi & (uint8_t)~0x01);
-  uecpRdsState.diPtyi = (strcmp(rds_di_artifhead,  "1") == 0) ? (uecpRdsState.diPtyi | 0x02) : (uecpRdsState.diPtyi & (uint8_t)~0x02);
-  uecpRdsState.diPtyi = (strcmp(rds_di_compressed, "1") == 0) ? (uecpRdsState.diPtyi | 0x04) : (uecpRdsState.diPtyi & (uint8_t)~0x04);
-  uecpRdsState.diPtyi = (strcmp(rds_ptyi,          "1") == 0) ? (uecpRdsState.diPtyi | 0x08) : (uecpRdsState.diPtyi & (uint8_t)~0x08);
+  main.tatp = (strcmp(rds_ta, "1") == 0) ? (main.tatp | 0x01) : (main.tatp & (uint8_t)~0x01);
+  main.tatp = (strcmp(rds_tp, "1") == 0) ? (main.tatp | 0x02) : (main.tatp & (uint8_t)~0x02);
+  main.ms   = (strcmp(rds_ms, "1") == 0) ? (main.ms   | 0x01) : (main.ms   & (uint8_t)~0x01);
+  main.diPtyi = (strcmp(rds_di_stereo,     "1") == 0) ? (main.diPtyi | 0x01) : (main.diPtyi & (uint8_t)~0x01);
+  main.diPtyi = (strcmp(rds_di_artifhead,  "1") == 0) ? (main.diPtyi | 0x02) : (main.diPtyi & (uint8_t)~0x02);
+  main.diPtyi = (strcmp(rds_di_compressed, "1") == 0) ? (main.diPtyi | 0x04) : (main.diPtyi & (uint8_t)~0x04);
+  main.diPtyi = (strcmp(rds_ptyi,          "1") == 0) ? (main.diPtyi | 0x08) : (main.diPtyi & (uint8_t)~0x08);
 
   currentFreqDeviation = atoi(frequency_deviation);
   currentInputImpedance = atoi(input_impedance);
@@ -724,6 +767,9 @@ void handleFormSubmit() {
   tx.setTxInputBufferGain(currentBufferGain);
   tx.setPreEmphasis(currentPreEmphasis);
   tx.setTxSoftClippingEnable(currentSoftClip);
+
+  // Last, so everything above lands in the data set that was active when the form was submitted.
+  if (rds_dsn[0]   != '\0') rdsSelectDataSet(uecpRdsState, (uint8_t) atoi(rds_dsn));
 
   server.send(200, "text/html", response);
 }
@@ -810,14 +856,46 @@ void setup() {
   // Inicializa a comunicação serial
   Serial.begin(115200);
 
-  rdsTxStateSetDefaults(uecpRdsState);
+  rdsEncoderStateSetDefaults(uecpRdsState);
+  // Apply this sketch's own RDS station-identity defaults (see the rdsDefault* constants above) to
+  // DSN 1's main service, overriding the generic library placeholders rdsEncoderStateSetDefaults()
+  // just set - rdsCopyDataSet1ToAll() below then gives every other data set the same starting
+  // point. Written directly into ps[] (not the psPending staging area MEC 0x02 and the web form's
+  // PS field use) since nothing has been transmitted yet - there's no "torn mid-cycle" receiver to
+  // protect against.
+  RdsDataSet&     ds   = rdsActiveDataSet(uecpRdsState);
+  RdsMainService& main = ds.main;
+  main.pi[0] = (uint8_t)(rdsDefaultPI >> 8);
+  main.pi[1] = (uint8_t)(rdsDefaultPI & 0xFF);
+  {
+    uint8_t psEbu[RDS_PS_LEN];
+    memset(psEbu, ' ', RDS_PS_LEN); // pad short values with spaces - utf8ToEbu() never pads itself
+    utf8ToEbu(rdsDefaultPS, psEbu, RDS_PS_LEN);
+    memcpy(main.ps, psEbu, RDS_PS_LEN);
+  }
+  {
+    // rtCount is only set to 1 if rdsDefaultRT actually converts to some real text - an empty
+    // string leaves it at 0, so Group 2A isn't built until a real RT message arrives.
+    RtMessage& msg  = main.rt[0];
+    msg.textLen     = (uint8_t) utf8ToEbu(rdsDefaultRT, msg.text, RDS_RT_MAX_LEN);
+    msg.repeatCount = 0; // loop forever
+    msg.toggleAB    = false;
+    main.rtCount    = (msg.textLen > 0) ? 1 : 0;
+  }
+  main.pty    = rdsDefaultPTY;
+  main.tatp   = (rdsDefaultTA ? 0x01 : 0x00) | (rdsDefaultTP ? 0x02 : 0x00);
+  main.ms     = rdsDefaultMusic ? 0x01 : 0x00;
+  main.diPtyi = (rdsDefaultStereo ? 0x01 : 0x00) | (rdsDefaultArtificialHead ? 0x02 : 0x00) |
+                (rdsDefaultCompressed ? 0x04 : 0x00) | (rdsDefaultDynamicPTY ? 0x08 : 0x00);
+
   // Seed the live, runtime-mutable group sequence from this sketch's own boot default - see
-  // RDS_SEQUENCE's own comment above. rdsTxStateSetDefaults() itself leaves these zeroed (it has
+  // RDS_SEQUENCE's own comment above. rdsEncoderStateSetDefaults() itself leaves it empty (it has
   // no sketch-specific sequence of its own to default to), so this is the .ino's own job, same as
   // ffPoolInit()/odaLiveDirectoryInit() just below.
-  memcpy(uecpRdsState.rdsSequence, RDS_SEQUENCE, RDS_SEQUENCE_LEN);
-  uecpRdsState.rdsSequenceLen = RDS_SEQUENCE_LEN;
-  uecpRdsState.rdsSeqPos      = 0;
+  memcpy(ds.rdsSequence, RDS_SEQUENCE, RDS_SEQUENCE_LEN);
+  ds.rdsSequenceLen = RDS_SEQUENCE_LEN;
+  // Every data set (DSN 1-6) starts out identical to DSN 1 as just configured.
+  rdsCopyDataSet1ToAll(uecpRdsState);
   ffPoolInit(ffPool);
   odaLiveDirectoryInit(odaLiveDir);
 
@@ -826,6 +904,8 @@ void setup() {
   // The line below may be necessary to setup I2C pins on ESP32
   Wire.begin(ESP32_I2C_SDA, ESP32_I2C_SCL);
   // Conecta na rede Wi-Fi
+  WiFi.setHostname(hostname); // both of these must come before WiFi.begin() to take effect
+  WiFi.enableIPv6();
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(1000);

@@ -45,16 +45,21 @@
      UECP_MAX_SITE_ADDRESSES/UECP_MAX_ENCODER_ADDRESSES (4/8) entries, replacing the whole
      respective list each time the key is sent (see applyConfigLine() below).
   3. Pre-config line: some UECP sources never send every field (e.g. no MEC 0x01 for PI, or no
-     DSN/PSN datasets/PIC assigned), and some values (this device's own DSN/PSN/site/encoder
-     identity, and the boot frequency/power/audio parameters) have no UECP MEC of their own at
+     DSN/PSN datasets/PIC assigned), and some values (this device's own site/encoder identity,
+     and the boot frequency/power/audio parameters) have no UECP MEC of their own at
      all. A single text line - "CFG KEY=VALUE KEY=VALUE ...\n" - sent over the same serial
      connection lets a companion tool (see tcp2serial.py's --config option) push those in once,
      any time before or between UECP frames, without needing a UECP frame or a web form. Keys not
      present in the line are left untouched. A value containing a space must be quoted (e.g.
      PS="MY RADIO") - see nextCfgToken() below; unquoted values (most keys, which never contain a
      space anyway) work exactly as a bare KEY=VALUE token always has. Recognised keys: PI (hex),
-     DSN, PSN, SITE, ENC (comma-separated lists, see point 2 above), POWER, FREQ, PTY, STEREO,
-     PREEMPH, DERIV, IMPED, GAIN, SOFTCLIP (all decimal except PI), and:
+     SITE, ENC (comma-separated lists, see point 2 above), POWER, FREQ, PTY, STEREO, PREEMPH,
+     DERIV, IMPED, GAIN, SOFTCLIP (all decimal except PI), and:
+       - DSN=1..6 - switches the active data set (the one on air); its main service goes on air
+         immediately. Every RDS content key after it in the same line (PI, PTY, PS, RT, SEQ, PSN)
+         applies to the newly active data set. All six boot identical (see setup()).
+       - PSN=1..255 - renumbers the active data set's main service, i.e. the PSN UECP elements
+         must address it by (PSN 0 always reaches it regardless). Boot default is 1.
        - PS=text (e.g. PS="MY RADIO") - for a UECP source that never sends its own MEC 0x02.
          Applied exactly like a real MEC 0x02 (staged into psPending, not written to ps[] directly
          - see rds_state.h's psPending/psPendingValid comment).
@@ -137,9 +142,10 @@ uint8_t  currentBufferGain    = 1;
 uint8_t  currentSoftClip      = 0;
 
 // --- Fixed boot-time RDS station-identity defaults (no web form in this variant - edit and
-// re-flash). Applied in setup(), right after rdsTxStateSetDefaults(uecpRdsState) (see below),
+// re-flash). Applied in setup(), right after rdsEncoderStateSetDefaults(uecpRdsState) (see below),
 // overriding the generic placeholder values that shared library call sets (rds_defaults.cpp, the
-// same one every sketch in this project calls) - same "edit the constant, re-flash" pattern as the
+// same one every sketch in this project calls), to every data set's main service alike (DSN 1-6,
+// PSN 1) - same "edit the constant, re-flash" pattern as the
 // frequency/power/audio parameters above, just for RDS content instead of transmitter hardware
 // settings. Still fully reconfigurable afterwards at runtime exactly as before: a UECP frame (MEC
 // 0x01=PI, 0x02=PS, 0x0A=RT, 0x07=PTY, 0x03=TA/TP, 0x04=DI, 0x05=MS) or, for PI/PS/RT/PTY, a CFG
@@ -184,7 +190,7 @@ QN8066 tx;
 
 // RDS state fed exclusively by UECP frames arriving over Serial. Single source of truth for
 // everything rds_scheduler.cpp's buildNextGroup() transmits.
-RdsTxState uecpRdsState;
+RdsEncoderState uecpRdsState;
 
 // Per-group free-format queues fed by UECP MEC 0x24/0x30/0x40/0x46 - see free_format_groups.h.
 // Independent of uecpRdsState: this is purely additional groups/content layered on top of this
@@ -214,8 +220,8 @@ uint8_t pendingImmediateGroupIndex = FF_INDEX_NONE;
 // UECP_MAX_ENCODER_ADDRESSES (4/8) each.
 UecpAddressConfig uecpOurAddress;
 
-// Boot-time default group sequence, copied into uecpRdsState.rdsSequence[]/rdsSequenceLen once in
-// setup() (see rdsTxStateSetDefaults()'s call site below). Editing these two constants and
+// Boot-time default group sequence, copied into every data set's rdsSequence[]/rdsSequenceLen once
+// in setup() (see rdsEncoderStateSetDefaults()'s call site below). Editing these two constants and
 // re-flashing changes only the *default* - the live, actually-scheduled copy in uecpRdsState is
 // what rds_scheduler.cpp's buildNextGroup() reads, and is independently reconfigurable at runtime
 // (UECP MEC 0x16, or the "SEQ" CFG key) without touching either of these.
@@ -282,7 +288,7 @@ static char* nextCfgToken(char** cursor, bool* unterminated) {
 }
 
 // Applies one "CFG KEY=VALUE KEY=VALUE ...\n" line - a lightweight way to preset values that
-// either have no UECP MEC of their own (this device's own DSN/PSN/site/encoder identity, and the
+// either have no UECP MEC of their own (this device's own site/encoder identity, and the
 // boot-time frequency/power/audio parameters) or that a particular UECP source might simply never
 // send (e.g. no MEC 0x01 for PI). Unrecognised keys and a line that doesn't start with "CFG" are
 // ignored; keys omitted from the line leave that setting untouched. line is modified in place
@@ -302,14 +308,29 @@ void applyConfigLine(char* line) {
     const char* key = tok;
     const char* val = eq + 1;
 
+    // Every RDS content key below writes to whichever data set is active at the point that key is
+    // reached - so "CFG DSN=2 PS=..." sets DSN 2's PS. Each branch looks the active main service up
+    // afresh for exactly that reason.
     if (strcmp(key, "PI") == 0) {
+      RdsMainService& main = rdsActiveMain(uecpRdsState);
       uint16_t pi = (uint16_t) strtol(val, nullptr, 16);
-      uecpRdsState.pi[0] = (uint8_t)(pi >> 8);
-      uecpRdsState.pi[1] = (uint8_t)(pi & 0xFF);
+      main.pi[0] = (uint8_t)(pi >> 8);
+      main.pi[1] = (uint8_t)(pi & 0xFF);
     } else if (strcmp(key, "DSN") == 0) {
-      uecpRdsState.dsn = (uint8_t) atoi(val);
+      // Switches the active data set (1-6) - the same thing UECP MEC 0x1C will do.
+      if (!rdsSelectDataSet(uecpRdsState, (uint8_t) atoi(val))) {
+        Serial.printf("CFG: DSN=%s out of range (1-%u), ignored\n", val, RDS_DSN_COUNT);
+        continue;
+      }
     } else if (strcmp(key, "PSN") == 0) {
-      uecpRdsState.psn = (uint8_t) atoi(val);
+      // Renumbers the active data set's main service (1-255) - the PSN that UECP elements must
+      // address it by (PSN 0 always reaches it regardless).
+      uint8_t psn = (uint8_t) atoi(val);
+      if (psn == 0) {
+        Serial.println("CFG: PSN=0 isn't a valid service number (1-255), ignored");
+        continue;
+      }
+      rdsActiveMain(uecpRdsState).psnNumber = psn;
     } else if (strcmp(key, "SITE") == 0) {
       // Comma-separated list of decimal site addresses (e.g. SITE=1,2,3) - replaces the whole site
       // address list wholesale, same "replace, don't append" convention as SEQ= below; up to
@@ -341,7 +362,7 @@ void applyConfigLine(char* line) {
       }
       continue;
     } else if (strcmp(key, "PTY") == 0) {
-      uecpRdsState.pty = (uint8_t) atoi(val);
+      rdsActiveMain(uecpRdsState).pty = (uint8_t) atoi(val);
     } else if (strcmp(key, "POWER") == 0) {
       currentPower = (uint8_t) atoi(val);
       // setPAC() toggles the chip's SYSTEM1.recal bit, which per the QN8066 library's own comment
@@ -382,11 +403,12 @@ void applyConfigLine(char* line) {
                                         // pads the rest of out[] itself
       utf8ToEbu(val, psEbu, RDS_PS_LEN);
       // Staged into psPending exactly like a real MEC 0x02 element (see uecpApplyMec() in
-      // uecp_handler.cpp), not written to state.ps[] directly - sendRDS() swaps it in at the next
+      // uecp_handler.cpp), not written to ps[] directly - buildGroup0A() swaps it in at the next
       // clean psSegment==0 wrap so a receiver never sees old/new characters torn mid-cycle (see
       // rds_state.h's psPending/psPendingValid comment).
-      memcpy(uecpRdsState.psPending, psEbu, RDS_PS_LEN);
-      uecpRdsState.psPendingValid = true;
+      RdsMainService& main = rdsActiveMain(uecpRdsState);
+      memcpy(main.psPending, psEbu, RDS_PS_LEN);
+      main.psPendingValid = true;
       Serial.printf("CFG PS=\"%s\" applied (staged, takes effect within one PS cycle)\n", val);
       continue;
     } else if (strcmp(key, "RT") == 0) {
@@ -397,15 +419,16 @@ void applyConfigLine(char* line) {
       // uecp_handler.cpp's uecpApplyRt() - applied immediately, since RT's own A/B flag is the
       // receiver-facing "content changed" signal and a torn mid-cycle transition is the
       // spec-compliant way it's expected to propagate, unlike PS which has no such flag of its own.
-      memset(uecpRdsState.rt, 0, sizeof(uecpRdsState.rt));
-      uecpRdsState.rt[0].textLen     = (uint8_t) utf8ToEbu(val, uecpRdsState.rt[0].text, RDS_RT_MAX_LEN);
-      uecpRdsState.rt[0].repeatCount = 0; // infinite
-      uecpRdsState.rt[0].toggleAB    = true;
-      uecpRdsState.rtCount           = 1;
-      uecpRdsState.rtCurrent         = 0;
-      uecpRdsState.rtSegment         = 0;
-      uecpRdsState.rtRepeatsDone     = 0;
-      uecpRdsState.rtABFlag          = !uecpRdsState.rtABFlag;
+      RdsMainService& main = rdsActiveMain(uecpRdsState);
+      memset(main.rt, 0, sizeof(main.rt));
+      main.rt[0].textLen         = (uint8_t) utf8ToEbu(val, main.rt[0].text, RDS_RT_MAX_LEN);
+      main.rt[0].repeatCount     = 0; // infinite
+      main.rt[0].toggleAB        = true;
+      main.rtCount               = 1;
+      uecpRdsState.rtCurrent     = 0;
+      uecpRdsState.rtSegment     = 0;
+      uecpRdsState.rtRepeatsDone = 0;
+      main.rtABFlag              = !main.rtABFlag;
       Serial.printf("CFG RT=\"%s\" applied\n", val);
       continue;
     } else if (strcmp(key, "ODA") == 0) {
@@ -459,8 +482,9 @@ void applyConfigLine(char* line) {
       // Capped at RDS_SEQUENCE_MAX_LEN entries; extras are silently dropped, same as MEC 0x16's
       // own spec-level LEN cap. Does its own logging, so it skips straight to the next token
       // afterwards.
-      char*   p      = eq + 1;
-      uint8_t newLen = 0;
+      RdsDataSet& ds     = rdsActiveDataSet(uecpRdsState);
+      char*       p      = eq + 1;
+      uint8_t     newLen = 0;
       while (*p != '\0' && newLen < RDS_SEQUENCE_MAX_LEN) {
         char* comma = strchr(p, ',');
         if (comma != nullptr) *comma = '\0';
@@ -469,15 +493,15 @@ void applyConfigLine(char* line) {
         for (const char* q = p; *q; q++) {
           if (*q == 'B' || *q == 'b') { versionB = true; break; }
         }
-        uecpRdsState.rdsSequence[newLen++] = ffGroupIndex(groupType, versionB);
+        ds.rdsSequence[newLen++] = ffGroupIndex(groupType, versionB);
         if (comma == nullptr) break;
         p = comma + 1;
       }
       if (newLen == 0) {
         Serial.println("CFG: SEQ value had no valid entries, ignored");
       } else {
-        uecpRdsState.rdsSequenceLen = newLen;
-        uecpRdsState.rdsSeqPos      = 0; // restart from the new sequence's own beginning
+        ds.rdsSequenceLen      = newLen;
+        uecpRdsState.rdsSeqPos = 0; // restart from the new sequence's own beginning
         Serial.printf("CFG SEQ applied (%u entries)\n", newLen);
       }
       continue;
@@ -542,48 +566,51 @@ void handleSerialInput() {
 void setup() {
   Serial.begin(115200);
 
-  rdsTxStateSetDefaults(uecpRdsState);
+  rdsEncoderStateSetDefaults(uecpRdsState);
 
-  // Apply this sketch's own RDS station-identity defaults (see the rdsDefault* constants above),
-  // overriding the generic library placeholders rdsTxStateSetDefaults() just set. Written directly
-  // into uecpRdsState (not the psPending staging area MEC 0x02 and CFG PS= use)
+  // Apply this sketch's own RDS station-identity defaults (see the rdsDefault* constants above) to
+  // DSN 1's main service, overriding the generic library placeholders rdsEncoderStateSetDefaults()
+  // just set - then rdsCopyDataSet1ToAll() below gives every other data set the same starting
+  // point. Written directly into ps[] (not the psPending staging area MEC 0x02 and CFG PS= use)
   // since this runs before rdsSchedulerStart() below has ever transmitted anything - there's no
-  // "torn mid-cycle" receiver to protect against yet, exactly like rdsTxStateSetDefaults() itself
-  // writes state.ps[]/state.rt[] directly.
-  uecpRdsState.pi[0] = (uint8_t)(rdsDefaultPI >> 8);
-  uecpRdsState.pi[1] = (uint8_t)(rdsDefaultPI & 0xFF);
+  // "torn mid-cycle" receiver to protect against yet, exactly like rdsEncoderStateSetDefaults()
+  // itself writes ps[]/rt[] directly.
+  RdsDataSet&     ds   = rdsActiveDataSet(uecpRdsState);
+  RdsMainService& main = ds.main;
+  main.pi[0] = (uint8_t)(rdsDefaultPI >> 8);
+  main.pi[1] = (uint8_t)(rdsDefaultPI & 0xFF);
   {
     uint8_t psEbu[RDS_PS_LEN];
     memset(psEbu, ' ', RDS_PS_LEN); // pad short values with spaces, same as applyConfigLine()'s PS= key
     utf8ToEbu(rdsDefaultPS, psEbu, RDS_PS_LEN);
-    memcpy(uecpRdsState.ps, psEbu, RDS_PS_LEN);
+    memcpy(main.ps, psEbu, RDS_PS_LEN);
   }
   // rtCount is only set to 1 below if rdsDefaultRT actually converts to some real text - an empty
-  // string (see rdsDefaultRT's own comment above) leaves it at 0 (rdsTxStateSetDefaults()'s own
-  // boot default), so rds_scheduler.cpp's buildNextGroup() won't build Group 2A until a real RT
+  // string (see rdsDefaultRT's own comment above) leaves it at 0 (rdsEncoderStateSetDefaults()'s
+  // own boot default), so rds_scheduler.cpp's buildNextGroup() won't build Group 2A until a real RT
   // message arrives via UECP/CFG/web, same as the shared library's own "no RT configured" state.
   {
-    RtMessage& msg  = uecpRdsState.rt[0];
+    RtMessage& msg  = main.rt[0];
     msg.textLen     = (uint8_t) utf8ToEbu(rdsDefaultRT, msg.text, RDS_RT_MAX_LEN);
     msg.repeatCount = 0; // loop forever
     msg.toggleAB    = false;
-    uecpRdsState.rtCount   = (msg.textLen > 0) ? 1 : 0;
-    uecpRdsState.rtCurrent = 0;
-    uecpRdsState.rtSegment = 0;
+    main.rtCount    = (msg.textLen > 0) ? 1 : 0;
   }
-  uecpRdsState.pty    = rdsDefaultPTY;
-  uecpRdsState.tatp   = (rdsDefaultTA ? 0x01 : 0x00) | (rdsDefaultTP ? 0x02 : 0x00);
-  uecpRdsState.ms     = rdsDefaultMusic ? 0x01 : 0x00;
-  uecpRdsState.diPtyi = (rdsDefaultStereo ? 0x01 : 0x00) | (rdsDefaultArtificialHead ? 0x02 : 0x00) |
-                        (rdsDefaultCompressed ? 0x04 : 0x00) | (rdsDefaultDynamicPTY ? 0x08 : 0x00);
+  main.pty    = rdsDefaultPTY;
+  main.tatp   = (rdsDefaultTA ? 0x01 : 0x00) | (rdsDefaultTP ? 0x02 : 0x00);
+  main.ms     = rdsDefaultMusic ? 0x01 : 0x00;
+  main.diPtyi = (rdsDefaultStereo ? 0x01 : 0x00) | (rdsDefaultArtificialHead ? 0x02 : 0x00) |
+                (rdsDefaultCompressed ? 0x04 : 0x00) | (rdsDefaultDynamicPTY ? 0x08 : 0x00);
 
   // Seed the live, runtime-mutable group sequence from this sketch's own boot default - see
-  // RDS_SEQUENCE's own comment above. rdsTxStateSetDefaults() itself leaves these zeroed (it has
+  // RDS_SEQUENCE's own comment above. rdsEncoderStateSetDefaults() itself leaves it empty (it has
   // no sketch-specific sequence of its own to default to), so this is the .ino's own job, same as
   // ffPoolInit()/odaLiveDirectoryInit() just below.
-  memcpy(uecpRdsState.rdsSequence, RDS_SEQUENCE, RDS_SEQUENCE_LEN);
-  uecpRdsState.rdsSequenceLen = RDS_SEQUENCE_LEN;
-  uecpRdsState.rdsSeqPos      = 0;
+  memcpy(ds.rdsSequence, RDS_SEQUENCE, RDS_SEQUENCE_LEN);
+  ds.rdsSequenceLen = RDS_SEQUENCE_LEN;
+
+  // Every data set (DSN 1-6) starts out identical to the DSN 1 just configured above.
+  rdsCopyDataSet1ToAll(uecpRdsState);
   ffPoolInit(ffPool);
   odaLiveDirectoryInit(odaLiveDir);
 

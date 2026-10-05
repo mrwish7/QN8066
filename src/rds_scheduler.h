@@ -11,7 +11,7 @@
 // separate compiled binary, so those statics are never shared *across* sketches despite the source
 // being one shared copy; they're just hidden from sketches that have no business touching them.
 //
-// This owns none of the actual protocol/session state (RdsTxState, FreeFormatPool) or the chip
+// This owns none of the actual protocol/session state (RdsEncoderState, FreeFormatPool) or the chip
 // handle (QN8066) - those stay declared in each sketch's own .ino (as they must: each sketch has
 // its own hardware wiring and its own single instance of the RDS session) and are passed in by
 // reference, the same convention uecp_handler.h's processUecpFrame() already uses.
@@ -35,12 +35,12 @@ void rdsSchedulerReset();
 // (also ported into this project's Linux UECP test harness, which must never touch a real host
 // system clock) never touches the system clock directly. Call every loop() iteration; near-instant
 // once state.ctPending is set, a no-op otherwise.
-void rdsSchedulerApplyPendingTime(RdsTxState& state);
+void rdsSchedulerApplyPendingTime(RdsEncoderState& state);
 
 // The whole per-loop-iteration RDS pipeline in one call: builds the next group if there's room in
 // the internal buffer - deciding what to build exactly like this project's old per-sketch
 // buildNextGroup() did (Group 4A on a real UTC minute boundary first, then a pending MEC 0x46
-// "immediate" message if one's set, then state.rdsSequence's own walk - free-format content always
+// "immediate" message if one's set, then the active data set's rdsSequence walk - free-format content always
 // winning over struct-backed fallbacks for whichever group comes up) - then services the chip via
 // the non-blocking async API, waiting for the chip's own confirmation (never an arbitrary timeout
 // on the normal path) before sending the next one. Never delay()/blocks, so loop() stays fully
@@ -50,5 +50,5 @@ void rdsSchedulerApplyPendingTime(RdsTxState& state);
 // message has ever set state.ctOffset (state.ctFromUecp) - each sketch computes this from its own
 // hardcoded local-time constants (see each .ino's computeLocalOffsetByte()), since that's a
 // deployment/location property, not something this shared scheduler should own a single value for.
-void rdsSchedulerTick(QN8066& tx, RdsTxState& state, FreeFormatPool& ffPool,
+void rdsSchedulerTick(QN8066& tx, RdsEncoderState& state, FreeFormatPool& ffPool,
                       uint8_t& pendingImmediateGroupIndex, uint8_t fallbackOffsetByte);

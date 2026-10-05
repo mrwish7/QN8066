@@ -256,16 +256,16 @@ const char INDEX_HTML[] PROGMEM = R"QNHTML(
                     </span>
                 </div>
                 <div class="field-row">
-                    <span class="field-label">UECP Site Address:</span>
+                    <span class="field-label">UECP Site Address(es):</span>
                     <span class="field-control">
-                        <input type="text" id="uecp_site" name="uecp_site" maxlength="3" placeholder="0-3FF hex, 0=all" value="0">
+                        <input type="text" id="uecp_site" name="uecp_site" maxlength="15" placeholder="0-3FF hex, comma list up to 4, 0=all" value="0">
                         <button type="button" class="set-btn" onclick="sendData('uecp_site')">&rarr;</button>
                     </span>
                 </div>
                 <div class="field-row">
-                    <span class="field-label">UECP Encoder Address:</span>
+                    <span class="field-label">UECP Encoder Address(es):</span>
                     <span class="field-control">
-                        <input type="text" id="uecp_enc" name="uecp_enc" maxlength="2" placeholder="0-3F hex, 0=all" value="0">
+                        <input type="text" id="uecp_enc" name="uecp_enc" maxlength="23" placeholder="0-3F hex, comma list up to 8, 0=all" value="0">
                         <button type="button" class="set-btn" onclick="sendData('uecp_enc')">&rarr;</button>
                     </span>
                 </div>

@@ -1,4 +1,5 @@
 #include "uecp_handler.h"
+#include "rds_defaults.h"
 #include <string.h>
 
 // ---------------------------------------------------------------------------
@@ -18,33 +19,36 @@ static uint16_t uecpCrc16(const uint8_t* data, uint16_t len) {
   return 0xFFFF - crc;
 }
 
+// True if value (one half of a frame's ADD field) is accepted by one of our own configured address
+// lists. Matches if the frame's value is 0 (the UECP spec's "all sites"/"all encoders" wildcard for
+// that half), if our own list contains 0 (we don't filter on that half at all - the boot default),
+// or if the value is in our list.
+static bool uecpAddressPartMatches(uint16_t value, const uint16_t* ours, uint8_t count) {
+  if (value == 0) return true;
+  for (uint8_t i = 0; i < count; i++) {
+    if (ours[i] == 0 || ours[i] == value) return true;
+  }
+  return false;
+}
+
 // True if a UECP frame's ADD field (addr: 10-bit site address <<6 | 6-bit encoder address, as
 // packed in the frame header) should be accepted by this device, given its own configured
 // site/encoder address list(s) (ourAddress - see UecpAddressConfig's own comment in
-// uecp_handler.h). Matching rule, preserved from this project's original single-address behaviour
-// and generalized to multiple addresses (per the UECP spec, an encoder may be configured with more
-// than one site address and more than one encoder address): a frame addressed 0x0000 ("all
-// sites/all encoders", the UECP spec's own convention) always matches; this device's own default
-// policy - exactly one site address and one encoder address configured, both 0 - means it accepts
-// every frame regardless of address; otherwise, the frame's address must exactly equal one of this
-// device's own (site, encoder) combinations - every configured site paired with every configured
-// encoder, since the spec doesn't tie a particular site to a particular encoder, so any pairing
-// counts as a match.
+// uecp_handler.h). The site and encoder halves are checked independently (see
+// uecpAddressPartMatches()) and both must match - the spec doesn't tie a particular site to a
+// particular encoder, and either half of a frame's address can be the 0 wildcard on its own. So
+// with ENC=1,6 and no SITE configured, a frame for site 256/encoder 0 (0x4000 - every encoder at
+// that site) is accepted, as are site 0/encoder 1 and site 0/encoder 6, but site 0/encoder 2 isn't.
+// The boot default (one site and one encoder address, both 0) accepts every frame.
 static bool uecpAddressMatches(uint16_t addr, const UecpAddressConfig& ourAddress) {
-  if (ourAddress.siteCount == 1 && ourAddress.sites[0] == 0 &&
-      ourAddress.encoderCount == 1 && ourAddress.encoders[0] == 0) {
-    return true; // default policy - accept everything
-  }
-  if (addr == 0) return true; // frame's own "all sites/all encoders" wildcard
+  uint16_t site    = (uint16_t)((addr >> 6) & 0x03FF);
+  uint16_t encoder = (uint16_t)(addr & 0x3F);
 
-  for (uint8_t s = 0; s < ourAddress.siteCount; s++) {
-    uint16_t sitePart = (uint16_t)((ourAddress.sites[s] & 0x03FF) << 6);
-    for (uint8_t e = 0; e < ourAddress.encoderCount; e++) {
-      uint16_t combined = (uint16_t)(sitePart | (ourAddress.encoders[e] & 0x3F));
-      if (addr == combined) return true;
-    }
-  }
-  return false;
+  uint16_t ourEncoders[UECP_MAX_ENCODER_ADDRESSES];
+  for (uint8_t i = 0; i < ourAddress.encoderCount; i++) ourEncoders[i] = ourAddress.encoders[i];
+
+  return uecpAddressPartMatches(site, ourAddress.sites, ourAddress.siteCount) &&
+         uecpAddressPartMatches(encoder, ourEncoders, ourAddress.encoderCount);
 }
 
 // Byte de-stuffing (unescape_uecp in uecp_mp2.py).
@@ -82,6 +86,7 @@ static uint8_t uecpMecDataLen(uint8_t mec) {
       return RDS_PTYN_LEN;
     case 0x01: // PI
     case 0x06: // PIN
+    case 0x2E: // Linkage
       return 2;
     case 0x03: // TA/TP
     case 0x04: // DI/PTYI
@@ -93,40 +98,181 @@ static uint8_t uecpMecDataLen(uint8_t mec) {
   }
 }
 
-// UECP DSN address matching. 0 means "no DSN used" (a source that never partitions by dataset) and
-// always matches, regardless of what this device's own state.dsn is configured as. 255 is the
-// UECP spec's own "all datasets" wildcard (a source that does partition by dataset, but wants this
-// particular element to reach every one of them at once) - also always matches. Two genuinely
-// different source intents, but this project doesn't need to tell them apart: the effect ("apply
-// regardless of state.dsn") is identical either way. Was missing the 255 case entirely until a real
-// UECP source was observed sending it for exactly this "reaches our dataset too" purpose - every
-// element addressed that way was silently dropped as a mismatch instead.
-static inline bool uecpDsnMatches(uint8_t dsn, const RdsTxState& state) {
-  return dsn == 0 || dsn == 0xFF || state.dsn == 0 || dsn == state.dsn;
+// UECP DSN addressing: 0 = the active data set; 1..RDS_DSN_COUNT = that specific data set, whether
+// or not it's currently on air (this is how a source pre-loads a data set before switching to it);
+// 255 = the UECP spec's own "all data sets" wildcard. Anything else (7-254) names a data set this
+// encoder doesn't have. Returns a bitmask of the addressed dataSets[] indices (bit i = DSN i+1) -
+// 0 if none.
+static uint8_t uecpDsnTargets(uint8_t dsn, const RdsEncoderState& state) {
+  if (dsn == 0)             return (uint8_t)(1u << (state.activeDsn - 1));
+  if (dsn == 0xFF)          return (uint8_t)((1u << RDS_DSN_COUNT) - 1);
+  if (dsn <= RDS_DSN_COUNT) return (uint8_t)(1u << (dsn - 1));
+  return 0;
+}
+
+// Calls apply(dataSet, onAir) for every data set dsn addresses (see uecpDsnTargets()). onAir is true
+// for the active data set - callers use it to decide whether the on-air transmission positions
+// (RdsEncoderState::rdsSeqPos etc.) need resetting, since those only ever index into the active
+// data set's content. Returns the number of data sets matched.
+template <typename F>
+static uint8_t uecpForEachDataSet(RdsEncoderState& state, uint8_t dsn, F apply) {
+  uint8_t targets = uecpDsnTargets(dsn, state);
+  uint8_t matched = 0;
+  for (uint8_t i = 0; i < RDS_DSN_COUNT; i++) {
+    if ((targets & (1u << i)) == 0) continue;
+    apply(state.dataSets[i], (uint8_t)(i + 1) == state.activeDsn);
+    matched++;
+  }
+  return matched;
+}
+
+// One service a DSN+PSN-addressed element resolved to - exactly one of main/eon is set. onAir is
+// true for the active data set (see uecpForEachDataSet()).
+struct UecpServiceTarget {
+  RdsMainService* main;
+  RdsEonService*  eon;
+  bool            onAir;
+};
+
+// Like uecpForEachDataSet(), but for DSN+PSN-addressed MECs: calls apply(target) for the service the
+// PSN names in every addressed data set. PSN 0 or the data set's main service's own psnNumber
+// resolves to its main service; any other PSN is looked up among its EON services (its MEC 0x28 list).
+// Data sets whose list doesn't contain that PSN are skipped. Returns the number of services matched.
+template <typename F>
+static uint8_t uecpForEachService(RdsEncoderState& state, uint8_t dsn, uint8_t psn, F apply) {
+  uint8_t targets = uecpDsnTargets(dsn, state);
+  uint8_t matched = 0;
+  for (uint8_t i = 0; i < RDS_DSN_COUNT; i++) {
+    if ((targets & (1u << i)) == 0) continue;
+    RdsDataSet&       ds = state.dataSets[i];
+    UecpServiceTarget t  = { nullptr, nullptr, (uint8_t)(i + 1) == state.activeDsn };
+    if (psn == 0 || psn == ds.main.psnNumber) {
+      t.main = &ds.main;
+    } else {
+      for (uint8_t e = 0; e < ds.eonCount; e++) {
+        if (ds.eon[e].psnNumber == psn) { t.eon = &ds.eon[e]; break; }
+      }
+      if (t.eon == nullptr) continue;
+    }
+    apply(t);
+    matched++;
+  }
+  return matched;
+}
+
+// For MECs that only apply to a main service (RT, AF, Long PS, DI, MS, PTYN): calls
+// apply(mainService, onAir) for each main service the address resolves to. A PSN that resolves to an
+// EON service instead is counted in eonHits and skipped. Returns the number of main services applied to.
+template <typename F>
+static uint8_t uecpForEachMainService(RdsEncoderState& state, uint8_t dsn, uint8_t psn,
+                                      uint8_t& eonHits, F apply) {
+  uint8_t applied = 0;
+  uecpForEachService(state, dsn, psn, [&](UecpServiceTarget& t) {
+    if (t.main == nullptr) { eonHits++; return; }
+    apply(*t.main, t.onAir);
+    applied++;
+  });
+  return applied;
+}
+
+// Log lines for an element that wasn't applied anywhere - shared by every DSN-only and DSN+PSN MEC
+// branch in processUecpFrame().
+static void uecpLogNoDataSet(uint8_t mec, uint8_t dsn, const String& clientIp) {
+  Serial.printf("UECP MEC 0x%02X from %s ignored (DSN=%u - no such data set)\n",
+                mec, clientIp.c_str(), dsn);
+}
+static void uecpLogNoMatch(uint8_t mec, uint8_t dsn, uint8_t psn, const String& clientIp,
+                           const RdsEncoderState& state) {
+  if (uecpDsnTargets(dsn, state) == 0) {
+    uecpLogNoDataSet(mec, dsn, clientIp);
+  } else {
+    Serial.printf("UECP MEC 0x%02X from %s ignored (DSN=%u PSN=%u - no service with that PSN in "
+                  "that data set's PSN list)\n", mec, clientIp.c_str(), dsn, psn);
+  }
+}
+// wrongKindHits > 0: the PSN did resolve, but only to the kind of service this MEC can't apply to
+// (a main-service-only MEC addressed to an EON PSN, or MEC 0x14 addressed to a main service).
+static void uecpLogNotApplied(uint8_t mec, uint8_t dsn, uint8_t psn, uint8_t wrongKindHits,
+                              bool eonOnlyMec, const String& clientIp, const RdsEncoderState& state) {
+  if (wrongKindHits == 0) {
+    uecpLogNoMatch(mec, dsn, psn, clientIp, state);
+  } else if (eonOnlyMec) {
+    Serial.printf("UECP MEC 0x%02X from %s ignored (DSN=%u PSN=%u is a main service - this MEC only "
+                  "applies to EON services)\n", mec, clientIp.c_str(), dsn, psn);
+  } else {
+    Serial.printf("UECP MEC 0x%02X from %s ignored (DSN=%u PSN=%u is an EON service - this MEC only "
+                  "applies to a main service)\n", mec, clientIp.c_str(), dsn, psn);
+  }
 }
 
 // Applies one already DSN/PSN-matched element's MED bytes (MSB first, per the UECP spec's own
-// format tables) to the matching RdsTxState field.
-static void uecpApplyMec(uint8_t mec, const uint8_t* data, RdsTxState& state) {
+// format tables) to the matching main service field.
+static void uecpApplyMec(uint8_t mec, const uint8_t* data, RdsMainService& main) {
   switch (mec) {
-    case 0x01: state.pi[0]    = data[0]; state.pi[1]  = data[1]; break; // PI
-    case 0x02: // PS - staged, not written to ps[] directly: sendRDS() swaps it in at the next
+    case 0x01: main.pi[0]    = data[0]; main.pi[1]  = data[1]; break; // PI
+    case 0x02: // PS - staged, not written to ps[] directly: buildGroup0A() swaps it in at the next
                // clean psSegment==0 wrap so a receiver never sees old/new characters mixed
                // mid-cycle (see rds_state.h's psPending/psPendingValid comment).
-      memcpy(state.psPending, data, RDS_PS_LEN);
-      state.psPendingValid = true;
+      memcpy(main.psPending, data, RDS_PS_LEN);
+      main.psPendingValid = true;
       break;
-    case 0x03: state.tatp     = data[0];                         break; // TA/TP
-    case 0x04: state.diPtyi   = data[0];                         break; // DI/PTYI
-    case 0x05: state.ms       = data[0];                         break; // MS
-    case 0x06: state.pin[0]   = data[0]; state.pin[1] = data[1]; break; // PIN
-    case 0x07: state.pty      = data[0];                         break; // PTY
+    case 0x03: main.tatp     = data[0];                       break; // TA/TP
+    case 0x04: main.diPtyi   = data[0];                       break; // DI/PTYI
+    case 0x05: main.ms       = data[0];                       break; // MS
+    case 0x06: main.pin[0]   = data[0]; main.pin[1] = data[1]; break; // PIN
+    case 0x07: main.pty      = data[0];                       break; // PTY
     case 0x3E: // PTYN - applied immediately (see rds_state.h's ptyn comment), and the AB flag
                // flips unconditionally on every element, whether or not the text actually changed.
-      memcpy(state.ptyn, data, RDS_PTYN_LEN);
-      state.ptynABflag = !state.ptynABflag;
+      memcpy(main.ptyn, data, RDS_PTYN_LEN);
+      main.ptynABflag = !main.ptynABflag;
       break;
+    case 0x2E: main.linkage[0] = data[0]; main.linkage[1] = data[1]; break; // Linkage (stored only)
   }
+}
+
+// Same as uecpApplyMec(), for an EON service - only the fields Group 14A can carry. PS is written
+// straight to ps[] (no staging - see rds_state.h's RdsEonService comment). Returns false for a MEC an
+// EON service has no field for (DI, MS, PTYN), so the caller can log it as not applied.
+static bool uecpApplyEonMec(uint8_t mec, const uint8_t* data, RdsEonService& eon) {
+  switch (mec) {
+    case 0x01: eon.pi[0]      = data[0]; eon.pi[1]      = data[1]; return true; // PI
+    case 0x02: memcpy(eon.ps, data, RDS_PS_LEN);                    return true; // PS
+    case 0x03: eon.tatp       = data[0];                            return true; // TA/TP
+    case 0x06: eon.pin[0]     = data[0]; eon.pin[1]     = data[1]; return true; // PIN
+    case 0x07: eon.pty        = data[0];                            return true; // PTY
+    case 0x2E: eon.linkage[0] = data[0]; eon.linkage[1] = data[1]; return true; // Linkage
+    default:   return false;
+  }
+}
+
+// Applies one MEC 0x14 (EON AF) element to an EON service. startBytes is the 2-byte start location
+// (only 0x0000 - a complete list/entry - is supported, same as MEC 0x13); variant is the Group 14A
+// variant code the data is for; afData/afDataLen is everything after it, ending in a 0x00 terminator.
+//   - variant 4: the service's AF list (Method A) - stored in af[], terminator stripped. Unlike MEC
+//     0x13, an odd byte count is accepted: a Method A list is a count code plus N frequencies, and
+//     Group 14A variant 4 pads its final pair with the filler code.
+//   - variants 5-9: one mapped frequency pair {tuning frequency, mapped frequency} - stored in
+//     mapped[variant-5], replacing whatever that variant held.
+// Returns false (nothing changed) if rejected, so the caller can log why.
+static bool uecpApplyEonAf(const uint8_t* startBytes, uint8_t variant, const uint8_t* afData,
+                           uint16_t afDataLen, RdsEonService& eon) {
+  if (startBytes[0] != 0x00 || startBytes[1] != 0x00) return false; // only "from the start" supported
+  if (afDataLen == 0 || afData[afDataLen - 1] != 0x00) return false; // must end in the terminator
+  uint16_t freqLen = afDataLen - 1;
+
+  if (variant == 4) {
+    if (freqLen > RDS_AF_MAX_LEN) return false; // defensive cap - eon.af is fixed-size
+    memcpy(eon.af, afData, freqLen);
+    eon.afLen = (uint8_t)freqLen;
+    return true;
+  }
+  if (variant >= 5 && variant <= 9) {
+    if (freqLen != 2) return false; // exactly one {tuning, mapped} pair per variant
+    eon.mapped[variant - 5][0] = afData[0];
+    eon.mapped[variant - 5][1] = afData[1];
+    return true;
+  }
+  return false; // any other variant isn't an AF variant
 }
 
 // Applies one already DSN/PSN-matched RT (MEC 0x0A) element. A clearing replace is applied
@@ -152,8 +298,10 @@ static void uecpApplyMec(uint8_t mec, const uint8_t* data, RdsTxState& state) {
 // rds_state.h.
 //
 // Returns false if the message was dropped (buffer full) rather than applied, so the caller can
-// log accurately instead of claiming "applied" for a silent drop.
-static bool uecpApplyRt(uint8_t medByte, const uint8_t* text, uint16_t textLen, RdsTxState& state) {
+// log accurately instead of claiming "applied" for a silent drop. onAir: main is the active data
+// set's main service, so a clearing replace must also restart the on-air RT position in state.
+static bool uecpApplyRt(uint8_t medByte, const uint8_t* text, uint16_t textLen,
+                        RdsMainService& main, RdsEncoderState& state, bool onAir) {
   if (textLen > RDS_RT_MAX_LEN) textLen = RDS_RT_MAX_LEN; // defensive cap; never trust length data blindly
 
   bool    clearBuffer = ((medByte >> 5) & 0x03) == 0x00;
@@ -162,12 +310,14 @@ static bool uecpApplyRt(uint8_t medByte, const uint8_t* text, uint16_t textLen, 
 
   uint8_t slot;
   if (clearBuffer) {
-    memset(state.rt, 0, sizeof(state.rt));
-    slot                = 0;
-    state.rtCount       = 0; // genuinely empty unless a message actually gets stored below
-    state.rtCurrent     = 0;
-    state.rtSegment     = 0;
-    state.rtRepeatsDone = 0;
+    memset(main.rt, 0, sizeof(main.rt));
+    slot         = 0;
+    main.rtCount = 0; // genuinely empty unless a message actually gets stored below
+    if (onAir) {
+      state.rtCurrent     = 0;
+      state.rtSegment     = 0;
+      state.rtRepeatsDone = 0;
+    }
 
     if (textLen == 0) {
       // Clear-only, no replacement text (see this function's own comment above) - rtCount stays 0.
@@ -175,7 +325,7 @@ static bool uecpApplyRt(uint8_t medByte, const uint8_t* text, uint16_t textLen, 
       // treated as "first after a pause" (see rtSeeded's own comment below and in rds_state.h) and
       // forced onto the A position, rather than toggling relative to whatever rtABFlag happened to
       // be left at before this pause.
-      state.rtSeeded = false;
+      main.rtSeeded = false;
       return true;
     }
 
@@ -188,27 +338,27 @@ static bool uecpApplyRt(uint8_t medByte, const uint8_t* text, uint16_t textLen, 
     // relative to, so rtABFlag is forced to false (the A position) outright rather than being
     // derived from this message's own bit at all - "leave it unchanged" isn't enough here, since a
     // prior run could have left it at B.
-    if (!state.rtSeeded) {
-      state.rtSeeded = true;
-      state.rtABFlag = false;
+    if (!main.rtSeeded) {
+      main.rtSeeded = true;
+      main.rtABFlag = false;
     } else if (toggleAB) {
-      state.rtABFlag = !state.rtABFlag;
+      main.rtABFlag = !main.rtABFlag;
     }
   } else {
-    if (state.rtCount >= RDS_RT_BUFFER_SIZE) return false; // buffer full - drop, per the MED spec's own convention
-    slot = state.rtCount;
+    if (main.rtCount >= RDS_RT_BUFFER_SIZE) return false; // buffer full - drop, per the MED spec's own convention
+    slot = main.rtCount;
     // Appending doesn't "start" transmission of anything yet - the scheduler's own rotation
     // (buildGroup2A()'s rtCurrent/rtRepeatsDone cycling) will reach this slot in due course once
     // the messages ahead of it have each been shown their configured repeatCount times, so the
     // live A/B flag isn't touched here.
   }
 
-  RtMessage& msg = state.rt[slot];
+  RtMessage& msg = main.rt[slot];
   memcpy(msg.text, text, textLen);
   msg.textLen     = (uint8_t)textLen;
   msg.repeatCount = repeatCount;
   msg.toggleAB    = toggleAB;
-  state.rtCount = slot + 1;
+  main.rtCount = slot + 1;
   return true;
 }
 
@@ -218,21 +368,23 @@ static bool uecpApplyRt(uint8_t medByte, const uint8_t* text, uint16_t textLen, 
 // supported for now: MED must be 0x0000 ("insert from offset 0"), and the data must end in a
 // single 0x00 terminator marking a complete list - anything else (a non-zero insert offset, a
 // missing terminator, or an odd frequency-byte count, since they're transmitted two at a time -
-// see sendRDS()'s Group 0A branch) is rejected outright rather than guessed at. Applied
+// see rds_scheduler.cpp's buildGroup0A()) is rejected outright rather than guessed at. Applied
 // immediately, like RT - no staging, since (unlike PS) there's no existing receiver convention
 // for signalling "AF list is mid-update" that a torn transmission would violate.
-// Returns false (state.af/afLen untouched) if rejected, so the caller can log why.
-static bool uecpApplyAf(const uint8_t* medBytes, const uint8_t* afData, uint16_t afDataLen, RdsTxState& state) {
+// Returns false (main.af/afLen untouched) if rejected, so the caller can log why. onAir: main is
+// the active data set's main service, so the on-air AF position in state restarts too.
+static bool uecpApplyAf(const uint8_t* medBytes, const uint8_t* afData, uint16_t afDataLen,
+                        RdsMainService& main, RdsEncoderState& state, bool onAir) {
   if (medBytes[0] != 0x00 || medBytes[1] != 0x00) return false; // only "from the start" supported
   if (afDataLen == 0 || afData[afDataLen - 1] != 0x00) return false; // must end in the full-list terminator
 
   uint16_t freqLen = afDataLen - 1;
   if ((freqLen & 0x01) != 0) return false;   // sent two bytes at a time; an odd count can't cycle evenly
-  if (freqLen > RDS_AF_MAX_LEN) return false; // defensive cap - state.af is fixed-size
+  if (freqLen > RDS_AF_MAX_LEN) return false; // defensive cap - main.af is fixed-size
 
-  memcpy(state.af, afData, freqLen);
-  state.afLen     = (uint8_t)freqLen;
-  state.afSegment = 0;
+  memcpy(main.af, afData, freqLen);
+  main.afLen = (uint8_t)freqLen;
+  if (onAir) state.afSegment = 0;
   return true;
 }
 
@@ -244,11 +396,11 @@ static bool uecpApplyAf(const uint8_t* medBytes, const uint8_t* afData, uint16_t
 // (unlike RT, which is never staged): long PS has no A/B flag of its own to signal "content
 // changed" to a receiver, so unlike RT there's no spec-sanctioned "torn transition is fine" case to
 // fall back on - staging is the only sane behaviour here.
-static void uecpApplyLongPs(const uint8_t* data, uint8_t dataLen, RdsTxState& state) {
+static void uecpApplyLongPs(const uint8_t* data, uint8_t dataLen, RdsMainService& main) {
   if (dataLen > RDS_LONG_PS_MAX_LEN) dataLen = RDS_LONG_PS_MAX_LEN; // defensive cap; never trust length data blindly
-  memcpy(state.longPsPending, data, dataLen);
-  state.longPsPendingLen   = dataLen;
-  state.longPsPendingValid = true;
+  memcpy(main.longPsPending, data, dataLen);
+  main.longPsPendingLen   = dataLen;
+  main.longPsPendingValid = true;
 }
 
 // Applies MEC 0x0D (Time). Unlike every other MEC handled here, this one carries no DSN/PSN field
@@ -259,10 +411,10 @@ static void uecpApplyLongPs(const uint8_t* data, uint8_t dataLen, RdsTxState& st
 // (1-31), hour (0-23), minute (0-59), second (0-59), centisecond (0-99), then a local time offset
 // byte: bit5 = sign (0=+, 1=-), bits4-0 = magnitude in half-hours, or 0xFF meaning "leave the
 // current offset unchanged". Date/time is UTC, matching the RDS Group 4A fields it ultimately
-// feeds (see sendRDS()'s Group 4A branch) - the offset only fills in that group's otherwise-
+// feeds (see rds_scheduler.cpp's buildNextGroup() Group 4A branch) - the offset only fills in that group's otherwise-
 // unknowable local-time-offset bits, it never affects the UTC value itself.
 // Deliberately does NOT touch the system clock here - see rds_state.h's ctPending comment for why.
-static void uecpApplyTime(const uint8_t* data, RdsTxState& state) {
+static void uecpApplyTime(const uint8_t* data, RdsEncoderState& state) {
   state.ctYear        = (uint16_t)(2000 + data[0]);
   state.ctMonth       = data[1];
   state.ctDay         = data[2];
@@ -281,42 +433,75 @@ static void uecpApplyTime(const uint8_t* data, RdsTxState& state) {
 // Applies MEC 0x1A (SLC - Slow Labelling Codes). Like MEC 0x0D, this one is DSN-only - no PSN
 // field exists for it at all. data is the 2-byte MED: bits6-4 of the first byte give the SLC
 // application's variant index (0-7), which doubled is the byte offset to store both bytes at in
-// state.slc[] - stored verbatim (including those same variant bits), since sendRDS()'s Group 1A
-// branch reads slc[idx]/slc[idx+1] straight into the transmitted block 3 unmodified.
-static void uecpApplySlc(const uint8_t* data, RdsTxState& state) {
+// the data set's slc[] - stored verbatim (including those same variant bits), since
+// buildGroup1A() reads slc[idx]/slc[idx+1] straight into the transmitted block 3 unmodified.
+static void uecpApplySlc(const uint8_t* data, RdsDataSet& ds) {
   uint8_t index = (uint8_t)(((data[0] & 0x70) >> 4) * 2);
-  state.slc[index]     = data[0];
-  state.slc[index + 1] = data[1];
+  ds.slc[index]     = data[0];
+  ds.slc[index + 1] = data[1];
 }
 
 // Applies MEC 0x29 (Group variant code sequence) for group 0x02 (RDS Group 1A) - group 0x1C
 // (Group 14A) is a real, spec-defined option too, but this project doesn't implement Group 14A
 // yet, so it's silently ignored rather than guessed at; any other group value is likewise
 // ignored. data/dataLen is the sequence of variant indices (0-7, matching uecpApplySlc()'s slc[]
-// slots) sendRDS() should cycle through for Group 1A - copied into state.slcSeq[], capped at its
-// fixed capacity ("drop if the sequence is too long", per spec). slcCurrent resets to 0 so the
-// new sequence always starts from its own beginning rather than wherever the old one left off.
-static void uecpApplySlcSeq(const uint8_t* data, uint16_t dataLen, RdsTxState& state) {
+// slots) buildGroup1A() should cycle through - copied into the data set's slcSeq[], capped at its
+// fixed capacity ("drop if the sequence is too long", per spec). If the data set is on air,
+// slcCurrent resets to 0 so the new sequence always starts from its own beginning rather than
+// wherever the old one left off.
+static void uecpApplySlcSeq(const uint8_t* data, uint16_t dataLen, RdsDataSet& ds,
+                            RdsEncoderState& state, bool onAir) {
   uint16_t copyLen = dataLen;
-  if (copyLen > sizeof(state.slcSeq)) copyLen = sizeof(state.slcSeq);
-  memcpy(state.slcSeq, data, copyLen);
-  state.slcSeqLen  = (uint8_t)copyLen;
-  state.slcCurrent = 0;
+  if (copyLen > sizeof(ds.slcSeq)) copyLen = sizeof(ds.slcSeq);
+  memcpy(ds.slcSeq, data, copyLen);
+  ds.slcSeqLen = (uint8_t)copyLen;
+  if (onAir) state.slcCurrent = 0;
+}
+
+// Applies MEC 0x29 (Group variant code sequence) for group 0x1C (RDS Group 14A): data/dataLen is
+// the order of 14A variant codes (0-15) each EON service is walked through - see rds_scheduler.cpp's
+// buildGroup14A(). Copied into the data set's eonVariantSeq[], capped at RDS_EON_SEQ_MAX. If the
+// data set is on air, the current service's walk restarts from the new sequence's beginning.
+static void uecpApplyEonVariantSeq(const uint8_t* data, uint16_t dataLen, RdsDataSet& ds,
+                                   RdsEncoderState& state, bool onAir) {
+  uint16_t copyLen = dataLen;
+  if (copyLen > RDS_EON_SEQ_MAX) copyLen = RDS_EON_SEQ_MAX;
+  for (uint16_t i = 0; i < copyLen; i++) ds.eonVariantSeq[i] = data[i] & 0x0F;
+  ds.eonVariantSeqLen = (uint8_t)copyLen;
+  if (onAir) {
+    state.eonSeqPos = 0;
+    state.eonAfPos  = 0;
+  }
+}
+
+// Arms the Group 14B TA burst (see rds_state.h's eonTaBurstRemaining) after eon's TA flag changed -
+// but only if eon is an enabled EON service of the active data set and Group 14A is in that data
+// set's group sequence (without 14A, receivers don't know about the EON services at all).
+static void uecpArmEonTaBurst(RdsEncoderState& state, const RdsEonService& eon) {
+  RdsDataSet& ds = rdsActiveDataSet(state);
+  if (&eon < ds.eon || &eon >= ds.eon + ds.eonCount) return; // not the on-air data set's
+  if (!eon.enabled || !rdsSequenceHasGroup(state, ffGroupIndex(14, false))) return;
+  state.eonTaBurstIndex     = (uint8_t)(&eon - ds.eon);
+  state.eonTaBurstRemaining = 8;
+  Serial.printf("UECP: EON PSN %u TA now %s - sending a Group 14B burst\n", eon.psnNumber,
+                (eon.tatp & 0x01) ? "on" : "off");
 }
 
 // Applies MEC 0x16 (Group sequence) - replaces this project's own RDS group scheduling order
 // wholesale (rds_scheduler.cpp's buildNextGroup() dispatch - see rds_state.h's rdsSequence[] comment).
 // data/dataLen is the new sequence itself, one ffGroupIndex()-packed byte per entry, copied into
-// state.rdsSequence[] capped at its fixed capacity ("drop if the sequence is too long", per spec -
-// MEC 0x16's own LEN field is already capped at RDS_SEQUENCE_MAX_LEN, so this never actually trims
-// in practice). rdsSeqPos resets to 0 so the new sequence is read from its own beginning rather
-// than wherever the old one left off - same reasoning as uecpApplySlcSeq()'s slcCurrent reset above.
-static void uecpApplySequence(const uint8_t* data, uint16_t dataLen, RdsTxState& state) {
+// the data set's rdsSequence[] capped at its fixed capacity ("drop if the sequence is too long", per
+// spec - MEC 0x16's own LEN field is already capped at RDS_SEQUENCE_MAX_LEN, so this never actually
+// trims in practice). If the data set is on air, rdsSeqPos resets to 0 so the new sequence is read
+// from its own beginning rather than wherever the old one left off - same reasoning as
+// uecpApplySlcSeq()'s slcCurrent reset above.
+static void uecpApplySequence(const uint8_t* data, uint16_t dataLen, RdsDataSet& ds,
+                              RdsEncoderState& state, bool onAir) {
   uint16_t copyLen = dataLen;
   if (copyLen > RDS_SEQUENCE_MAX_LEN) copyLen = RDS_SEQUENCE_MAX_LEN;
-  memcpy(state.rdsSequence, data, copyLen);
-  state.rdsSequenceLen = (uint8_t)copyLen;
-  state.rdsSeqPos      = 0;
+  memcpy(ds.rdsSequence, data, copyLen);
+  ds.rdsSequenceLen = (uint8_t)copyLen;
+  if (onAir) state.rdsSeqPos = 0;
 }
 
 // Applies one Group 3A ODA AID/group definition - shared by MEC 0x24 (when targeting Group 3A),
@@ -343,7 +528,7 @@ static void uecpApplySequence(const uint8_t* data, uint16_t dataLen, RdsTxState&
 static bool applyGroup3ADefinition(FreeFormatPool& ffPool, OdaLiveDirectory& odaLiveDir,
                                    uint8_t targetGroupIndex, uint16_t aid, uint16_t messageBytes,
                                    bool cyclic, uint8_t flags, bool immediate,
-                                   uint8_t& pendingImmediateGroupIndex, const RdsTxState& state,
+                                   uint8_t& pendingImmediateGroupIndex, const RdsEncoderState& state,
                                    const String& clientIp, const char* mecLabel) {
   uint8_t group3AIndex = ffGroupIndex(3, false);
   odaLiveDirectorySet(odaLiveDir, aid, targetGroupIndex);
@@ -395,7 +580,7 @@ static void applyOdaDirectGroupData(FreeFormatPool& ffPool, const OdaLiveDirecto
                                     uint16_t aid, uint8_t block2Last5, uint16_t block3,
                                     uint16_t block4, uint8_t bufferConfig, uint8_t flags,
                                     bool immediate, bool wantVersionB,
-                                    uint8_t& pendingImmediateGroupIndex, const RdsTxState& state,
+                                    uint8_t& pendingImmediateGroupIndex, const RdsEncoderState& state,
                                     const String& clientIp) {
   uint8_t mappedGroupIndex;
   if (!odaLiveDirectoryGet(odaLiveDir, aid, &mappedGroupIndex)) {
@@ -442,10 +627,11 @@ static void applyOdaDirectGroupData(FreeFormatPool& ffPool, const OdaLiveDirecto
 // ---------------------------------------------------------------------------
 // Public entry point
 //
-// Handles the fixed-layout MEC subset (PI/TA-TP/DI-PTYI/MS/PIN/PTY/PTYN) via a real per-element
-// DSN/PSN-matched walk, plus RT (MEC 0x0A), AF (MEC 0x13), and Long PS (MEC 0x21) as special
-// MEL-bearing cases, and Time (MEC 0x0D) / group sequence (MEC 0x16, DSN-only) / SLC (MEC 0x1A, DSN-only) / group
-// variant sequence (MEC 0x29, DSN-only) /
+// Handles the fixed-layout MEC subset (PI/TA-TP/DI-PTYI/MS/PIN/PTY/PTYN/Linkage) via a real
+// per-element DSN/PSN-matched walk, plus RT (MEC 0x0A), AF (MEC 0x13), Long PS (MEC 0x21) and EON AF
+// (MEC 0x14) as special MEL-bearing cases, and Time (MEC 0x0D) / data set select (MEC 0x1C) / PSN
+// list (MEC 0x28) / EON enable (MEC 0x0B, DSN-only) / group sequence (MEC 0x16, DSN-only) / SLC (MEC
+// 0x1A, DSN-only) / group variant sequence (MEC 0x29, DSN-only) /
 // Free-Format Group (MEC 0x24) / IH (MEC 0x25 - like MEC 0x24 but fixed to Group 6A/6B, the same
 // way TMC below is fixed to Group 8A) / MEC 0x40 (ODA AID/group definition, an alternate encoding
 // of a Group 3A definition) / MEC 0x42 (ODA Free-Format Group - like MEC 0x24 but Group 3B and
@@ -460,7 +646,7 @@ static void applyOdaDirectGroupData(FreeFormatPool& ffPool, const OdaLiveDirecto
 // ---------------------------------------------------------------------------
 
 void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
-                      const String& clientIp, RdsTxState& state, FreeFormatPool& ffPool,
+                      const String& clientIp, RdsEncoderState& state, FreeFormatPool& ffPool,
                       OdaLiveDirectory& odaLiveDir, uint8_t& pendingImmediateGroupIndex,
                       const UecpAddressConfig& ourAddress) {
   // 1. De-stuff
@@ -508,12 +694,8 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
   Serial.printf("UECP packet from %s: SQC=%u, %u message byte(s)\n", clientIp.c_str(), sqc,
                 (unsigned)(msgEnd - 4));
 
-  // 5. Walk message elements, applying any of the fixed-layout MECs whose DSN/PSN match ours.
-  // DSN matching (uecpDsnMatches() above) handles the "no DSN used"/0 and "all datasets"/255
-  // wildcards; PSN matching stays deliberately simple for now (either side being 0 means "anything
-  // matches") - the UECP spec's own fuller PSN semantics (specific set / all-except-current / all)
-  // are a later refinement, same as DSN's used to be before 255 turned up on a real source and
-  // needed handling.
+  // 5. Walk message elements, applying each one to whichever data set(s)/service(s) its DSN/PSN
+  // address - see uecpDsnTargets() and uecpForEachService() above for the addressing rules.
   uint16_t pos = 4;
   while (pos < msgEnd) {
     uint8_t mec = destuffed[pos];
@@ -542,15 +724,16 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
         // MEC+DSN+PSN+MEL only, with no medByte and no text at all (see uecpApplyRt()'s own
         // comment). Synthesizes medByte=0x00 (clearing bits, no repeat, no toggle - there's no
         // real byte to read any of those from).
-        bool dsnMatches = uecpDsnMatches(dsn, state);
-        bool psnMatches = (psn == 0 || state.psn == 0 || psn == state.psn);
-        if (dsnMatches && psnMatches) {
-          uecpApplyRt(0x00, nullptr, 0, state);
+        uint8_t eonHits = 0;
+        uint8_t matched = uecpForEachMainService(state, dsn, psn, eonHits,
+                                                 [&](RdsMainService& main, bool onAir) {
+          uecpApplyRt(0x00, nullptr, 0, main, state, onAir);
+        });
+        if (matched > 0) {
           Serial.printf("UECP applied MEC 0x0A RT clear (DSN=%u PSN=%u, no replacement text) from %s\n",
                         dsn, psn, clientIp.c_str());
         } else {
-          Serial.printf("UECP MEC 0x0A from %s ignored (DSN=%u PSN=%u, ours is %u/%u)\n",
-                        clientIp.c_str(), dsn, psn, state.dsn, state.psn);
+          uecpLogNotApplied(0x0A, dsn, psn, eonHits, false, clientIp, state);
         }
         pos = base;
         continue;
@@ -568,18 +751,20 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       const uint8_t* text    = &destuffed[base + 1];
       uint16_t       textLen = contentEnd - (base + 1);
 
-      bool dsnMatches = uecpDsnMatches(dsn, state);
-      bool psnMatches = (psn == 0 || state.psn == 0 || psn == state.psn);
-      if (dsnMatches && psnMatches) {
-        if (uecpApplyRt(medByte, text, textLen, state)) {
-          Serial.printf("UECP applied MEC 0x0A RT (DSN=%u PSN=%u, %u char(s)) from %s\n",
-                        dsn, psn, (unsigned)textLen, clientIp.c_str());
-        } else {
-          Serial.printf("UECP MEC 0x0A RT from %s dropped (RT buffer full)\n", clientIp.c_str());
-        }
+      uint8_t dropped = 0;
+      uint8_t eonHits = 0;
+      uint8_t matched = uecpForEachMainService(state, dsn, psn, eonHits,
+                                               [&](RdsMainService& main, bool onAir) {
+        if (!uecpApplyRt(medByte, text, textLen, main, state, onAir)) dropped++;
+      });
+      if (matched == 0) {
+        uecpLogNotApplied(0x0A, dsn, psn, eonHits, false, clientIp, state);
+      } else if (dropped == 0) {
+        Serial.printf("UECP applied MEC 0x0A RT (DSN=%u PSN=%u, %u char(s)) from %s\n",
+                      dsn, psn, (unsigned)textLen, clientIp.c_str());
       } else {
-        Serial.printf("UECP MEC 0x0A from %s ignored (DSN=%u PSN=%u, ours is %u/%u)\n",
-                      clientIp.c_str(), dsn, psn, state.dsn, state.psn);
+        Serial.printf("UECP MEC 0x0A RT from %s dropped for %u of %u service(s) (RT buffer full)\n",
+                      clientIp.c_str(), dropped, matched);
       }
 
       pos = contentEnd;
@@ -606,19 +791,23 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       const uint8_t* afData    = &destuffed[base + 2];
       uint16_t       afDataLen = mel - 2;
 
-      bool dsnMatches = uecpDsnMatches(dsn, state);
-      bool psnMatches = (psn == 0 || state.psn == 0 || psn == state.psn);
-      if (dsnMatches && psnMatches) {
-        if (uecpApplyAf(medBytes, afData, afDataLen, state)) {
-          Serial.printf("UECP applied MEC 0x13 AF (DSN=%u PSN=%u, %u freq byte(s)) from %s\n",
-                        dsn, psn, (unsigned)state.afLen, clientIp.c_str());
-        } else {
-          Serial.printf("UECP MEC 0x13 AF from %s rejected (only a full, from-start, even-length "
-                        "list is supported)\n", clientIp.c_str());
-        }
+      // Validation doesn't depend on which service it lands in, so every addressed service either
+      // accepts or rejects it alike. An EON service's AF list comes from MEC 0x14 instead, so a
+      // MEC 0x13 addressed to one is dropped.
+      bool    accepted = false;
+      uint8_t eonHits  = 0;
+      uint8_t matched  = uecpForEachMainService(state, dsn, psn, eonHits,
+                                                [&](RdsMainService& main, bool onAir) {
+        accepted = uecpApplyAf(medBytes, afData, afDataLen, main, state, onAir);
+      });
+      if (matched == 0) {
+        uecpLogNotApplied(0x13, dsn, psn, eonHits, false, clientIp, state);
+      } else if (accepted) {
+        Serial.printf("UECP applied MEC 0x13 AF (DSN=%u PSN=%u, %u freq byte(s)) from %s\n",
+                      dsn, psn, (unsigned)(afDataLen - 1), clientIp.c_str());
       } else {
-        Serial.printf("UECP MEC 0x13 from %s ignored (DSN=%u PSN=%u, ours is %u/%u)\n",
-                      clientIp.c_str(), dsn, psn, state.dsn, state.psn);
+        Serial.printf("UECP MEC 0x13 AF from %s rejected (only a full, from-start, even-length "
+                      "list is supported)\n", clientIp.c_str());
       }
 
       pos = base + mel;
@@ -644,18 +833,105 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       }
       const uint8_t* text = &destuffed[base];
 
-      bool dsnMatches = uecpDsnMatches(dsn, state);
-      bool psnMatches = (psn == 0 || state.psn == 0 || psn == state.psn);
-      if (dsnMatches && psnMatches) {
-        uecpApplyLongPs(text, mel, state);
+      uint8_t eonHits = 0;
+      uint8_t matched = uecpForEachMainService(state, dsn, psn, eonHits,
+                                               [&](RdsMainService& main, bool) {
+        uecpApplyLongPs(text, mel, main);
+      });
+      if (matched > 0) {
         Serial.printf("UECP applied MEC 0x21 Long PS (DSN=%u PSN=%u, %u char(s), staged) from %s\n",
                       dsn, psn, (unsigned)mel, clientIp.c_str());
       } else {
-        Serial.printf("UECP MEC 0x21 from %s ignored (DSN=%u PSN=%u, ours is %u/%u)\n",
-                      clientIp.c_str(), dsn, psn, state.dsn, state.psn);
+        uecpLogNotApplied(0x21, dsn, psn, eonHits, false, clientIp, state);
       }
 
       pos = base + mel;
+      continue;
+    }
+
+    if (mec == 0x14) {
+      // EON AF - an EON service's AF list or mapped frequencies, variable length via its own MEL
+      // byte: MEC[1] DSN[1] PSN[1] MEL[1] start[2] variant[1] AFdata[MEL-3] (see uecpApplyEonAf()).
+      // Only ever applies to EON services - a main service's AF list comes from MEC 0x13.
+      if ((uint16_t)(pos + 4) > msgEnd) {
+        Serial.printf("UECP EON AF element truncated (no MEL byte) from %s\n", clientIp.c_str());
+        break;
+      }
+      uint8_t  dsn  = destuffed[pos + 1];
+      uint8_t  psn  = destuffed[pos + 2];
+      uint8_t  mel  = destuffed[pos + 3];
+      uint16_t base = pos + 4;
+      if (mel < 3 || (uint16_t)(base + mel) > msgEnd) {
+        Serial.printf("UECP EON AF element (MEL=%u) truncated from %s\n", mel, clientIp.c_str());
+        break;
+      }
+      const uint8_t* startBytes = &destuffed[base];
+      uint8_t        variant    = destuffed[base + 2];
+      const uint8_t* afData     = &destuffed[base + 3];
+      uint16_t       afDataLen  = mel - 3;
+
+      bool    accepted = false;
+      uint8_t mainHits = 0;
+      uint8_t applied  = 0;
+      uecpForEachService(state, dsn, psn, [&](UecpServiceTarget& t) {
+        if (t.eon == nullptr) { mainHits++; return; }
+        accepted = uecpApplyEonAf(startBytes, variant, afData, afDataLen, *t.eon);
+        applied++;
+      });
+      if (applied == 0) {
+        uecpLogNotApplied(0x14, dsn, psn, mainHits, true, clientIp, state);
+      } else if (accepted) {
+        Serial.printf("UECP applied MEC 0x14 EON AF (DSN=%u PSN=%u, variant %u, %u byte(s)) from %s\n",
+                      dsn, psn, variant, (unsigned)(afDataLen - 1), clientIp.c_str());
+      } else {
+        Serial.printf("UECP MEC 0x14 EON AF (DSN=%u PSN=%u, variant %u) from %s rejected (needs start "
+                      "0x0000, a 0x00 terminator, variant 4 or 5-9, and exactly one pair for 5-9)\n",
+                      dsn, psn, variant, clientIp.c_str());
+      }
+
+      pos = base + mel;
+      continue;
+    }
+
+    if (mec == 0x0B) {
+      // EON service enable/disable - DSN only, no PSN field: MEC[1]+DSN[1]+LEN[1]+units[LEN], each
+      // unit 2 bytes: enable flag (1 = on, 0 = off) then an EON PSN. Only enabled EON services are
+      // transmitted on Group 14A (every EON service starts off - see rds_state.h's
+      // RdsEonService::enabled). A unit naming a PSN that isn't one of the data set's EON services
+      // (including its main service, which is always on air) is skipped; a trailing odd byte is ignored.
+      if ((uint16_t)(pos + 3) > msgEnd) {
+        Serial.printf("UECP EON-enable element truncated (no LEN byte) from %s\n", clientIp.c_str());
+        break;
+      }
+      uint8_t dsn = destuffed[pos + 1];
+      uint8_t len = destuffed[pos + 2];
+      if ((uint16_t)(pos + 3 + len) > msgEnd) {
+        Serial.printf("UECP EON-enable element (LEN=%u) truncated from %s\n", len, clientIp.c_str());
+        break;
+      }
+      const uint8_t* units = &destuffed[pos + 3];
+
+      uint8_t enabled = 0, disabled = 0, unknown = 0;
+      uint8_t matched = uecpForEachDataSet(state, dsn, [&](RdsDataSet& ds, bool) {
+        for (uint8_t u = 0; u + 1 < len; u += 2) {
+          bool    on  = units[u] != 0;
+          uint8_t psn = units[u + 1];
+          RdsEonService* eon = nullptr;
+          for (uint8_t e = 0; e < ds.eonCount; e++) {
+            if (ds.eon[e].psnNumber == psn) { eon = &ds.eon[e]; break; }
+          }
+          if (eon == nullptr) { unknown++; continue; }
+          eon->enabled = on;
+          if (on) enabled++; else disabled++;
+        }
+      });
+      if (matched > 0) {
+        Serial.printf("UECP applied MEC 0x0B EON enable (DSN=%u: %u enabled, %u disabled, %u unknown "
+                      "PSN(s)) from %s\n", dsn, enabled, disabled, unknown, clientIp.c_str());
+      } else {
+        uecpLogNoDataSet(0x0B, dsn, clientIp);
+      }
+      pos += 3 + len;
       continue;
     }
 
@@ -674,6 +950,81 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       continue;
     }
 
+    if (mec == 0x1C) {
+      // Data set select - switches which data set (DSN) is on air: MEC[1]+DSN[1], no PSN/MEL. The
+      // new data set's main service replaces the old one in every main-service group immediately
+      // (see rds_state.h's rdsSelectDataSet()). Only DSN 1..RDS_DSN_COUNT is meaningful here: 0
+      // ("current data set") would be a no-op by definition, and anything else names a data set
+      // this encoder doesn't have - both are dropped without changing anything.
+      if ((uint16_t)(pos + 2) > msgEnd) {
+        Serial.printf("UECP data-set-select element truncated from %s\n", clientIp.c_str());
+        break;
+      }
+      uint8_t dsn = destuffed[pos + 1];
+      if (dsn >= 1 && dsn <= RDS_DSN_COUNT) {
+        uint8_t previous = state.activeDsn;
+        rdsSelectDataSet(state, dsn);
+        Serial.printf("UECP applied MEC 0x1C data set select (DSN %u -> %u, main PSN %u) from %s\n",
+                      previous, dsn, rdsActiveMain(state).psnNumber, clientIp.c_str());
+      } else {
+        Serial.printf("UECP MEC 0x1C (DSN=%u) from %s ignored (only DSN 1-%u can be selected)\n",
+                      dsn, clientIp.c_str(), RDS_DSN_COUNT);
+      }
+      pos += 2;
+      continue;
+    }
+
+    if (mec == 0x28) {
+      // PSN list - (re)defines one data set's services: MEC[1]+DSN[1]+MEL[1]+main PSN[1]+other
+      // PSNs[MEL-1], where MEL counts the PSN bytes (main included). The first PSN becomes the data
+      // set's main service - the one MEC 0x1C puts on air - and the rest its EON services, all
+      // freshly initialised to defaults (see rds_defaults.h's rdsDefinePsnList()). Per spec, the
+      // active data set's list can't be redefined while it's on air - a source switches away
+      // (MEC 0x1C), redefines it, then switches back - so DSN 0 ("current") is rejected along with
+      // the active DSN itself, 255 and anything outside 1..RDS_DSN_COUNT.
+      if ((uint16_t)(pos + 3) > msgEnd) {
+        Serial.printf("UECP PSN-list element truncated (no MEL byte) from %s\n", clientIp.c_str());
+        break;
+      }
+      uint8_t dsn = destuffed[pos + 1];
+      uint8_t mel = destuffed[pos + 2];
+      if ((uint16_t)(pos + 3 + mel) > msgEnd) {
+        Serial.printf("UECP PSN-list element (MEL=%u) truncated from %s\n", mel, clientIp.c_str());
+        break;
+      }
+      const uint8_t* psns = &destuffed[pos + 3];
+
+      RdsPsnListResult result = rdsDefinePsnList(state, dsn, psns, mel);
+      switch (result) {
+        case RDS_PSN_LIST_OK:
+          Serial.printf("UECP applied MEC 0x28 PSN list (DSN %u: main PSN %u + %u EON service(s)) "
+                        "from %s\n", dsn, psns[0], (unsigned)(mel - 1), clientIp.c_str());
+          break;
+        case RDS_PSN_LIST_BAD_DSN:
+          Serial.printf("UECP MEC 0x28 (DSN=%u) from %s ignored (only DSN 1-%u can be defined)\n",
+                        dsn, clientIp.c_str(), RDS_DSN_COUNT);
+          break;
+        case RDS_PSN_LIST_ACTIVE_DSN:
+          Serial.printf("UECP MEC 0x28 (DSN=%u) from %s ignored (that data set is on air - switch "
+                        "away from it with MEC 0x1C first)\n", dsn, clientIp.c_str());
+          break;
+        case RDS_PSN_LIST_BAD_COUNT:
+          Serial.printf("UECP MEC 0x28 (DSN=%u) from %s ignored (%u PSN(s) - must be 1-%u)\n",
+                        dsn, clientIp.c_str(), mel, RDS_EON_PER_DSN_MAX + 1);
+          break;
+        case RDS_PSN_LIST_BAD_PSN:
+          Serial.printf("UECP MEC 0x28 (DSN=%u) from %s ignored (list contains PSN 0)\n",
+                        dsn, clientIp.c_str());
+          break;
+        case RDS_PSN_LIST_DUPLICATE:
+          Serial.printf("UECP MEC 0x28 (DSN=%u) from %s ignored (list contains a duplicate PSN)\n",
+                        dsn, clientIp.c_str());
+          break;
+      }
+      pos += 3 + mel;
+      continue;
+    }
+
     if (mec == 0x16) {
       // Group sequence - DSN only (no PSN), no MEL (it uses its own LEN field instead, capped at
       // 0xFC by spec rather than MEL's usual encoding): MEC[1]+DSN[1]+LEN[1]+Data[LEN].
@@ -689,13 +1040,14 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       }
       const uint8_t* data = &destuffed[pos + 3];
 
-      bool dsnMatches = uecpDsnMatches(dsn, state);
-      if (dsnMatches) {
-        uecpApplySequence(data, len, state);
+      uint8_t matched = uecpForEachDataSet(state, dsn, [&](RdsDataSet& ds, bool onAir) {
+        uecpApplySequence(data, len, ds, state, onAir);
+      });
+      if (matched > 0) {
         Serial.printf("UECP applied MEC 0x16 group sequence (DSN=%u, %u entries) from %s\n",
-                      dsn, (unsigned)state.rdsSequenceLen, clientIp.c_str());
+                      dsn, (unsigned)len, clientIp.c_str());
       } else {
-        Serial.printf("UECP MEC 0x16 from %s ignored (DSN=%u, ours is %u)\n", clientIp.c_str(), dsn, state.dsn);
+        uecpLogNoDataSet(0x16, dsn, clientIp);
       }
       pos += 3 + len;
       continue;
@@ -709,13 +1061,14 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       }
       uint8_t        dsn  = destuffed[pos + 1];
       const uint8_t* data = &destuffed[pos + 2];
-      bool dsnMatches = uecpDsnMatches(dsn, state);
-      if (dsnMatches) {
-        uecpApplySlc(data, state);
+      uint8_t matched = uecpForEachDataSet(state, dsn, [&](RdsDataSet& ds, bool) {
+        uecpApplySlc(data, ds);
+      });
+      if (matched > 0) {
         Serial.printf("UECP applied MEC 0x1A SLC (DSN=%u, variant %u) from %s\n",
                       dsn, (unsigned)((data[0] & 0x70) >> 4), clientIp.c_str());
       } else {
-        Serial.printf("UECP MEC 0x1A from %s ignored (DSN=%u, ours is %u)\n", clientIp.c_str(), dsn, state.dsn);
+        uecpLogNoDataSet(0x1A, dsn, clientIp);
       }
       pos += 4;
       continue;
@@ -737,18 +1090,21 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
       const uint8_t* data    = &destuffed[pos + 4];
       uint16_t       dataLen = (uint16_t)(mel - 1);
 
-      bool dsnMatches = uecpDsnMatches(dsn, state);
-      if (dsnMatches) {
-        if (group == 0x02) { // RDS Group 1A; Group 14A (0x1C) isn't implemented yet, so it's ignored below
-          uecpApplySlcSeq(data, dataLen, state);
-          Serial.printf("UECP applied MEC 0x29 group-variant-sequence (DSN=%u, %u entries) from %s\n",
-                        dsn, (unsigned)state.slcSeqLen, clientIp.c_str());
-        } else {
-          Serial.printf("UECP MEC 0x29 (DSN=%u, group=0x%02X) from %s ignored (only Group 1A/0x02 is supported)\n",
-                        dsn, group, clientIp.c_str());
-        }
+      if (group != 0x02 && group != 0x1C) { // Group 1A (0x02) or Group 14A (0x1C) only
+        Serial.printf("UECP MEC 0x29 (DSN=%u, group=0x%02X) from %s ignored (only Group 1A/0x02 and "
+                      "14A/0x1C are supported)\n", dsn, group, clientIp.c_str());
       } else {
-        Serial.printf("UECP MEC 0x29 from %s ignored (DSN=%u, ours is %u)\n", clientIp.c_str(), dsn, state.dsn);
+        uint8_t matched = uecpForEachDataSet(state, dsn, [&](RdsDataSet& ds, bool onAir) {
+          if (group == 0x02) uecpApplySlcSeq(data, dataLen, ds, state, onAir);
+          else               uecpApplyEonVariantSeq(data, dataLen, ds, state, onAir);
+        });
+        if (matched > 0) {
+          Serial.printf("UECP applied MEC 0x29 group-variant-sequence (DSN=%u, Group %s, %u entries) from %s\n",
+                        dsn, group == 0x02 ? "1A" : "14A", (unsigned)(dataLen > 16 ? 16 : dataLen),
+                        clientIp.c_str());
+        } else {
+          uecpLogNoDataSet(0x29, dsn, clientIp);
+        }
       }
       pos = pos + 3 + mel;
       continue;
@@ -1213,14 +1569,29 @@ void processUecpFrame(const uint8_t* rawInner, uint16_t rawLen,
     uint8_t        psn  = destuffed[pos + 2];
     const uint8_t* data = &destuffed[pos + 3];
 
-    bool dsnMatches = uecpDsnMatches(dsn, state);
-    bool psnMatches = (psn == 0 || state.psn == 0 || psn == state.psn);
-    if (dsnMatches && psnMatches) {
-      uecpApplyMec(mec, data, state);
+    // Main services take every MEC in this fixed-length set; EON services only the ones they have a
+    // field for (see uecpApplyEonMec()) - DI, MS and PTYN addressed to an EON PSN are dropped.
+    uint8_t applied = 0, eonHits = 0;
+    uecpForEachService(state, dsn, psn, [&](UecpServiceTarget& t) {
+      if (t.main != nullptr) {
+        uecpApplyMec(mec, data, *t.main);
+        applied++;
+        return;
+      }
+      uint8_t oldTa = t.eon->tatp & 0x01;
+      if (!uecpApplyEonMec(mec, data, *t.eon)) {
+        eonHits++;
+        return;
+      }
+      applied++;
+      // An EON service's TA changing gets signalled straight away with a Group 14B burst, rather
+      // than waiting for that service's next turn in the 14A walk.
+      if (mec == 0x03 && t.onAir && (t.eon->tatp & 0x01) != oldTa) uecpArmEonTaBurst(state, *t.eon);
+    });
+    if (applied > 0) {
       Serial.printf("UECP applied MEC 0x%02X (DSN=%u PSN=%u) from %s\n", mec, dsn, psn, clientIp.c_str());
     } else {
-      Serial.printf("UECP MEC 0x%02X from %s ignored (DSN=%u PSN=%u, ours is %u/%u)\n",
-                    mec, clientIp.c_str(), dsn, psn, state.dsn, state.psn);
+      uecpLogNotApplied(mec, dsn, psn, eonHits, false, clientIp, state);
     }
 
     pos += 3 + dataLen;
